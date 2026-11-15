@@ -5,17 +5,20 @@ import json
 import os
 import random
 import secrets
-import sqlite3
+
 import threading
 import time
 from collections import deque
 from pathlib import Path
 
+from . import checker as checker_mod
 from . import classifier as classifier_mod
 from . import embedder as embedder_mod
-from . import options as options_mod
+from . import figures as figures_mod
 from . import difficulty as diff
 from . import progress, recommender
+from .db import SafeDB
+from .embedder import EmbedderUnavailable
 from .vectors import VectorIndex, from_blob, to_blob
 
 SCHEMA = """
@@ -47,10 +50,16 @@ CREATE TABLE IF NOT EXISTS attempts (
   assignment_id INTEGER, answer TEXT, correct INTEGER NOT NULL, topic TEXT NOT NULL,
   level INTEGER NOT NULL, theta_before REAL, theta_after REAL, created_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS attempts_student ON attempts(student_id);
+CREATE TABLE IF NOT EXISTS explanations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, student_id TEXT NOT NULL, assignment_id INTEGER NOT NULL,
+  problem_id TEXT NOT NULL, text TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', result TEXT,
+  created_at TEXT NOT NULL, updated_at TEXT);
+CREATE INDEX IF NOT EXISTS explanations_assignment ON explanations(assignment_id, problem_id);
 """
+MAX_EXPLANATION = 2000
 
 CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"   # no 0/O, 1/I
-LETTERS = "ABCDE"
+LETTERS = ("A", "B", "C", "D", "E")   # a tuple: "" in "ABCDE" would be True
 
 
 class ApiError(Exception):
@@ -109,23 +118,40 @@ class Service:
         self.data_dir = Path(cfg["data_dir"])
         (self.data_dir / "uploads").mkdir(parents=True, exist_ok=True)
         self.seed_dir = Path(cfg["seed_dir"])
-        self.db = sqlite3.connect(str(self.data_dir / "app.db"), check_same_thread=False)
-        self.db.row_factory = sqlite3.Row
+        self.db = SafeDB(str(self.data_dir / "app.db"))      # shared by all request threads, one at a time
         self.db.executescript(SCHEMA)
-        if "num" not in {r[1] for r in self.db.execute("PRAGMA table_info(problems)")}:
+        cols = {r[1] for r in self.db.execute("PRAGMA table_info(problems)")}
+        if "num" not in cols:
             self.db.execute("ALTER TABLE problems ADD COLUMN num INTEGER")    # question number = difficulty
+        if "figures" not in cols:
+            self.db.execute("ALTER TABLE problems ADD COLUMN figures TEXT")   # teacher photos: figures.describe()
         self.db.execute("PRAGMA journal_mode=WAL")
         self.taxonomy = self._load_taxonomy()
+        fp = self.seed_dir / "figures.json"     # the bank's figures and option crops (seed/build_figures.py)
+        self.figures = json.loads(fp.read_text(encoding="utf-8")) if fp.exists() else {}
+        self.pipeline = figures_mod.Pipeline(cfg.get("ocr_handoff_path") or Path(__file__).resolve().parent.parent / "ocr_handoff")
         lp = self.seed_dir / "layout.json"
         self.layout = json.loads(lp.read_text(encoding="utf-8")) if lp.exists() else {"topics": {}}
         self.topics = [t for t in self.taxonomy if t != "Other"]
         self.embedder = embedder_mod.make(cfg)
+        self.approx_name = self.embedder.name + "~approx"
+        self.live = self.embedder.live or self.embedder.check()
+        self._retry_at = 0.0
+        # wording-only vectors of the bank, to approximate new texts while the model server is down
+        self.hasher = None if self.embedder.live else embedder_mod.HashEmbedder(384)
+        self.hash_index = VectorIndex(384)
+        self.bank_vecs = self._load_bank_vectors()
         self.index = VectorIndex(self.embedder.dim)
         self._meta = {}
         self._seed_if_empty()
         self._load_index()
-        self.classifier = classifier_mod.make(cfg, self.embedder, self.index, self.get)
+        print(f"embeddings: {self.embedder.name} ({'live' if self.live else 'precomputed bank, server not answering'})",
+              flush=True)
+        self.classifier = classifier_mod.make(cfg, lambda t: self.embed_text(t)[0], self.index, self.get)
         self.first = recommender.RandomRecommender()
+        self.checker = checker_mod.Worker(cfg, self._explanation_job, self._explanation_done)
+        for r in self.db.execute("SELECT id FROM explanations WHERE status='pending' ORDER BY id"):
+            self.checker.submit(r["id"])             # resume work left when the server stopped
         if cfg.get("demo_students") and len(self.index) and \
                 not self.db.execute("SELECT COUNT(*) FROM students").fetchone()[0]:
             from . import demo
@@ -151,30 +177,87 @@ class Service:
             p = json.loads(line)
             if p["answer"] not in LETTERS:
                 continue
-            vec = self.embedder.embed(p["text"])
+            vec = self.bank_vecs.get(p["id"])          # precomputed; anything else is embedded in _load_index
             rows.append((p["id"], p["topic"], p["subtopic"], p["level"], p["text"], p["answer"],
                          json.dumps(p.get("options") or {}), p.get("image") and "seed/" + p["image"],
-                         "m3kang", now(), to_blob(vec), self.embedder.name))
+                         "m3kang", now(), vec is not None and to_blob(vec) or None,
+                         self.embedder.name if vec is not None else None))
         with self.db:
             self.db.executemany(
                 "INSERT INTO problems (id, topic, subtopic, level, text, answer, options, image, source,"
                 " created_at, embedding, embedder) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", rows)
         print(f"seeded {len(rows)} problems", flush=True)
 
+    def _load_bank_vectors(self):
+        """Precomputed vectors of the bank for this model (seed/<bank>.json + .f32), if any."""
+        name = self.cfg["embedder"].get("bank")
+        if not name:
+            return {}
+        meta_p, data_p = self.seed_dir / f"{name}.json", self.seed_dir / f"{name}.f32"
+        if not (meta_p.exists() and data_p.exists()):
+            return {}
+        meta = json.loads(meta_p.read_text(encoding="utf-8"))
+        if meta["model"] != self.embedder.name or meta["dim"] != self.embedder.dim:
+            print(f"ignoring {data_p.name}: it is {meta['model']}/{meta['dim']}, not {self.embedder.name}", flush=True)
+            return {}
+        from array import array
+        flat = array("f")
+        flat.frombytes(data_p.read_bytes())
+        d = meta["dim"]
+        return {pid: flat[i * d:(i + 1) * d] for i, pid in enumerate(meta["ids"])}
+
+    def embed_text(self, text):
+        """(vector, model name) for a new text. The model server if it answers; if not, an
+        approximation: the similarity-weighted mean of the vectors of the bank problems with the
+        closest wording, stored as "<model>~approx" and redone when the server is back."""
+        if not self.live and time.time() >= self._retry_at and not self.embedder.live:
+            self.live = self.embedder.check()
+            self._retry_at = time.time() + 300
+        if self.live:
+            try:
+                return self.embedder.embed(text), self.embedder.name
+            except EmbedderUnavailable as e:
+                self.live, self._retry_at = False, time.time() + 300
+                print(f"embedding server not answering ({e}); approximating new texts", flush=True)
+        acc, total = [0.0] * self.embedder.dim, 0.0
+        for pid, s in self.hash_index.search(self.hasher.embed(text), k=8):
+            v = self.index.vector(pid)
+            if v is None or s <= 0:
+                continue
+            w = s * s
+            total += w
+            for k, x in enumerate(v):
+                acc[k] += w * x
+        if not total:
+            raise ApiError(503, "El modelo de embeddings no responde")
+        n = sum(x * x for x in acc) ** 0.5 or 1.0
+        return [x / n for x in acc], self.approx_name
+
     def _load_index(self):
-        stale = []
-        fill = []
+        stale, fill, pending = [], [], []
         for r in self.db.execute("SELECT id, topic, subtopic, level, num, embedding, embedder, text FROM problems"):
             num = r["num"] if r["num"] is not None else diff.question_number(r["id"])
             if r["num"] is None and num is not None:
                 fill.append((num, r["id"]))
             self._meta[r["id"]] = {"topic": r["topic"], "subtopic": r["subtopic"], "level": r["level"], "num": num}
-            if r["embedding"] is None or r["embedder"] != self.embedder.name:
-                vec = self.embedder.embed(r["text"])      # model changed: re-embed once
-                stale.append((to_blob(vec), self.embedder.name, r["id"]))
-            else:
+            vec = None
+            if r["embedding"] is not None and r["embedder"] == self.embedder.name:
                 vec = from_blob(r["embedding"])
+            elif r["id"] in self.bank_vecs:                       # model changed: take the precomputed vector
+                vec = self.bank_vecs[r["id"]]
+                stale.append((to_blob(vec), self.embedder.name, r["id"]))
+            elif r["embedding"] is not None and r["embedder"] == self.approx_name and not self.live:
+                vec = from_blob(r["embedding"])                   # keep the approximation until the server is back
+            if vec is not None:
+                self.index.add(r["id"], vec, r["level"], r["topic"])
+            else:
+                pending.append(r)
+            if self.hasher:
+                self.hash_index.add(r["id"], self.hasher.embed(r["text"] or r["subtopic"] or ""), r["level"], r["topic"])
+        for r in pending:                                         # new model, no precomputed vector
+            vec, name = self.embed_text(r["text"] or r["subtopic"] or "")
             self.index.add(r["id"], vec, r["level"], r["topic"])
+            stale.append((to_blob(vec), name, r["id"]))
         if stale or fill:
             with self.db:
                 self.db.executemany("UPDATE problems SET embedding=?, embedder=? WHERE id=?", stale)
@@ -344,6 +427,21 @@ class Service:
              "num": m.get("num"), "difficulty": m.get("g"),
              "text": r["text"], "options": json.loads(r["options"] or "{}"),
              "image": f"/media/{r['image']}" if r["image"] else None, "source": r["source"]}
+        # the statement is shown as text: the picture is only the figure (or the page, as a fallback)
+        if r["figures"]:
+            fig, base = json.loads(r["figures"]), "/media/"
+        else:
+            fig, base = (self.figures.get(r["id"]) if r["source"] == "m3kang" else None), "/media/seed/"
+        if fig:
+            if fig.get("figure"):
+                p["figure"] = base + fig["figure"]
+                p["figure_fallback"] = bool(fig.get("fallback"))
+            if fig.get("options"):
+                p["option_images"] = {L: base + f for L, f in fig["options"].items()}
+            if len(fig.get("texts") or {}) == 5 and r["source"] == "m3kang":
+                p["options"] = fig["texts"]                  # the team's repaired OCR of the options
+        elif r["image"]:
+            p["figure"] = p["image"]                         # a photo the pipeline couldn't process
         if with_answer:
             p.update(answer=r["answer"], auto_topic=r["auto_topic"], auto_confidence=r["auto_confidence"])
         return p
@@ -399,7 +497,7 @@ class Service:
         if not data:
             raise ApiError(400, "Falta la imagen")
         try:
-            return options_mod.read_options(self.cfg["answer_zone_path"], data)
+            return self.pipeline.read_options(data)
         except Exception as e:
             return {"available": True, "ok": False, "options": {}, "problems": {"*": str(e)}}
 
@@ -426,22 +524,33 @@ class Service:
         options = {k: str(v).strip() for k, v in (body.get("options") or {}).items()
                    if k in LETTERS and str(v).strip()}
         data, ext = self._decode_image(body.get("image"))
-        with self.lock, self.db:
+        with self.lock:
             n = self.db.execute("SELECT COUNT(*) FROM problems WHERE source='profe'").fetchone()[0]
             pid = f"profe-{n + 1:04d}"
             while self.db.execute("SELECT 1 FROM problems WHERE id=?", (pid,)).fetchone():
                 n += 1
                 pid = f"profe-{n + 1:04d}"
-            image = None
-            if data:
-                image = f"uploads/{pid}.{ext}"
-                (self.data_dir / image).write_bytes(data)
-            vec = self.embedder.embed(text or subtopic)
+        image, figs = None, None
+        if data:
+            image = f"uploads/{pid}.{ext}"
+            (self.data_dir / image).write_bytes(data)
+            if text:                         # the team's OCR: figure without the paragraph, option crops
+                try:
+                    figs = self.pipeline.process(pid, data, text, level, answer, self.data_dir / "ocr")
+                except Exception as e:      # a photo it can't read is still saved and shown as is
+                    print(f"figures: {pid}: {type(e).__name__}: {e}", flush=True)
+            if figs and not options:
+                options = figs["texts"]
+        with self.lock, self.db:
+            vec, ename = self.embed_text(text or subtopic)
             self.db.execute(
                 "INSERT INTO problems (id, topic, subtopic, level, num, text, answer, options, image, source, auto_topic,"
-                " auto_confidence, created_at, embedding, embedder) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " auto_confidence, created_at, embedding, embedder, figures) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (pid, topic, subtopic, level, num, text, answer, json.dumps(options), image, "profe",
-                 auto.get("topic"), auto.get("confidence"), now(), to_blob(vec), self.embedder.name))
+                 auto.get("topic"), auto.get("confidence"), now(), to_blob(vec), ename,
+                 json.dumps(figs) if figs else None))
+            if self.hasher:
+                self.hash_index.add(pid, self.hasher.embed(text or subtopic), level, topic)
             self._meta[pid] = {"topic": topic, "subtopic": subtopic, "level": level, "num": num,
                                "g": diff.general(self.ladder, level, num)}
             self.index.add(pid, vec, level, topic)
@@ -449,15 +558,20 @@ class Service:
         return self.problem(pid)
 
     def media_path(self, rel):
-        """Map /media/<rel> to a file: seed/... (read-only bank) or uploads/... (data dir)."""
+        """Map /media/<rel> to a file: seed/... (read-only bank: multimodal/, images/) or the data dir
+        (uploads/, ocr/: teacher photos and their crops). Nothing else is served."""
         rel = rel.replace("\\", "/")
-        if ".." in rel.split("/"):
+        if ".." in rel.split("/") or rel.startswith("/"):
             return None
         if rel.startswith("seed/"):
-            p = self.seed_dir / "images" / rel[5:]
+            rest = rel[5:]
+            cands = [self.seed_dir / rest] if rest.split("/")[0] in ("multimodal", "images") else []
+            cands.append(self.seed_dir / "images" / rest)          # older links: /media/seed/<id>.png
+        elif rel.split("/")[0] in ("uploads", "ocr"):
+            cands = [self.data_dir / rel]
         else:
-            p = self.data_dir / rel
-        return p if p.is_file() else None
+            return None
+        return next((p for p in cands if p.is_file()), None)
 
     # ---------- assignments ----------
     def _create_assignment(self, sid, kind, title, due, items):
@@ -478,7 +592,7 @@ class Service:
         done = a["status"] == "done"
         a["items"] = []
         for it in self.db.execute("SELECT * FROM assignment_items WHERE assignment_id=? ORDER BY position", (aid,)):
-            p = self.problem(it["problem_id"], with_answer=with_answers or done)
+            p = self.problem(it["problem_id"], with_answer=with_answers or done or it["answer"] is not None)
             a["items"].append({**p, "role": it["role"], "because": it["because"],
                                "given": it["answer"], "correct": None if it["correct"] is None else bool(it["correct"])})
         return a
@@ -493,6 +607,76 @@ class Service:
         d["last_result_id"] = last["id"] if last else None
         return d
 
+    def check(self, sid, body):
+        """Check one answer while the mission is open. The first answer is kept: after seeing
+        green or red the student can't change it. Grading and levels happen at submit()."""
+        aid = int(body.get("assignment_id") or 0)
+        pid = body.get("problem_id")
+        given = (body.get("answer") or "").strip().upper()[:1]
+        if given not in LETTERS:
+            raise ApiError(400, "Elige una opción de la A a la E")
+        with self.lock, self.db:
+            a = self.db.execute("SELECT status FROM assignments WHERE id=? AND student_id=?", (aid, sid)).fetchone()
+            if not a:
+                raise ApiError(404, "Tarea no encontrada")
+            if a["status"] != "open":
+                raise ApiError(409, "Esta tarea ya se entregó")
+            it = self.db.execute("SELECT position, answer FROM assignment_items WHERE assignment_id=? AND problem_id=?",
+                                 (aid, pid)).fetchone()
+            if not it:
+                raise ApiError(404, "Ese problema no está en tu misión")
+            right = self.db.execute("SELECT answer FROM problems WHERE id=?", (pid,)).fetchone()[0]
+            if it["answer"] is None:
+                self.db.execute("UPDATE assignment_items SET answer=?, correct=? WHERE assignment_id=? AND position=?",
+                                (given, int(given == right), aid, it["position"]))
+            else:
+                given = it["answer"]
+        return {"problem_id": pid, "given": given, "answer": right, "correct": given == right}
+
+    # ---------- optional written explanation of a wrong answer + calculation check (background) ----------
+    def add_explanation(self, sid, aid, body):
+        """Allowed for an answered, wrong item, while the mission is open or after it is submitted."""
+        pid = body.get("problem_id") or ""
+        text = (body.get("text") or "").strip()
+        if not text:
+            raise ApiError(400, "Escribe cómo lo resolviste")
+        if len(text) > MAX_EXPLANATION:
+            raise ApiError(400, f"Máximo {MAX_EXPLANATION} caracteres")
+        a = self._assignment(aid, sid)
+        item = next((it for it in a["items"] if it["id"] == pid), None)
+        if not item:
+            raise ApiError(404, "Ese problema no está en tu misión")
+        if item["given"] is None:
+            raise ApiError(409, "Primero responde el problema")
+        if item["correct"]:
+            raise ApiError(400, "Solo se explican los problemas fallados")
+        status = "pending" if self.checker.enabled else "off"
+        with self.lock, self.db:
+            self.db.execute("DELETE FROM explanations WHERE student_id=? AND assignment_id=? AND problem_id=?",
+                            (sid, aid, pid))
+            eid = self.db.execute(
+                "INSERT INTO explanations (student_id, assignment_id, problem_id, text, status, created_at)"
+                " VALUES (?,?,?,?,?,?)", (sid, aid, pid, text, status, now())).lastrowid
+        self.checker.submit(eid)
+        return self.explanations(sid, aid)
+
+    def explanations(self, sid, aid):
+        rows = self.db.execute("SELECT * FROM explanations WHERE student_id=? AND assignment_id=?", (sid, aid))
+        return {r["problem_id"]: {"id": r["id"], "text": r["text"], "status": r["status"],
+                                  "result": json.loads(r["result"]) if r["result"] else None,
+                                  "created_at": r["created_at"]} for r in rows}
+
+    def _explanation_job(self, eid):
+        r = self.db.execute("SELECT problem_id, text FROM explanations WHERE id=?", (eid,)).fetchone()
+        if not r:
+            raise LookupError(eid)
+        return self.problem(r["problem_id"]), r["text"]
+
+    def _explanation_done(self, eid, status, result):
+        with self.lock, self.db:
+            self.db.execute("UPDATE explanations SET status=?, result=?, updated_at=? WHERE id=?",
+                            (status, json.dumps(result), now(), eid))
+
     def submit(self, sid, body):
         aid = int(body.get("assignment_id") or 0)
         answers = body.get("answers") or {}
@@ -503,11 +687,12 @@ class Service:
             student = self._student(sid)
             skills = self._skills(sid)
             before = {t: th for t, (th, _) in skills.items()}
-            xp, mistakes, solved = 0, [], []
+            xp, mistakes, solved, skipped = 0, [], [], []
             for pos, it in enumerate(a["items"]):
-                given = (answers.get(it["id"]) or "").strip().upper()[:1]
-                if given not in LETTERS:
-                    raise ApiError(400, "Falta la respuesta de algún problema")
+                given = it["given"] or (answers.get(it["id"]) or "").strip().upper()[:1]
+                if given not in LETTERS:                  # skipped: no grade, back in the next mission
+                    skipped.append(it["id"])
+                    continue
                 ok = given == it["answer"]
                 theta, n = skills.get(it["topic"], (progress.initial_theta(student["start_level"]), 0))
                 new_theta, n = progress.update(theta, n, it["level"], ok)
@@ -520,6 +705,8 @@ class Service:
                     (sid, it["id"], aid, given, int(ok), it["topic"], it["level"], theta, new_theta, now()))
                 xp += 2 + (10 if ok else 0) + (5 if ok and it["role"] == "reto" else 0)
                 (solved if ok else mistakes).append(it["id"])
+            if not solved and not mistakes:
+                raise ApiError(400, "Contesta al menos un problema antes de entregar")
             for t, (th, n) in skills.items():
                 self.db.execute("INSERT OR REPLACE INTO skills VALUES (?,?,?,?)", (sid, t, th, n))
             # what to do next: prerequisites of each mistake + weekend task
@@ -528,19 +715,20 @@ class Service:
             prereq = {m: recommender.prerequisites(self, m, self.cfg["max_prerequisites_per_mistake"], history)
                       for m in mistakes}
             topic_theta = {t: th for t, (th, _) in skills.items() if t in self.topics}
-            items = recommender.weekend_task(self, topic_theta, mistakes, history | set(solved),
-                                             self.cfg["weekend_problems"], self.cfg["max_prerequisites_per_mistake"],
-                                             self.rng)
+            items = [{"problem_id": p, "role": "pendiente"} for p in skipped]
+            items += recommender.weekend_task(self, topic_theta, mistakes, history | set(solved) | set(skipped),
+                                              max(3, self.cfg["weekend_problems"] - len(skipped)),
+                                              self.cfg["max_prerequisites_per_mistake"], self.rng)
             due = next_weekend()
             next_id = self._create_assignment(sid, "finde", "Misión del fin de semana", due, items)
             changes = [{"topic": t, "before": round(before.get(t, th), 3), "after": round(th, 3)}
                        for t, (th, _) in skills.items() if t in self.topics and abs(th - before.get(t, th)) > 1e-9]
-            result = {"correct": len(solved), "total": len(a["items"]), "xp": xp, "changes": changes,
+            result = {"correct": len(solved), "total": len(solved) + len(mistakes), "skipped": skipped, "xp": xp, "changes": changes,
                       "prerequisites": prereq, "next_assignment": next_id}
             self.db.execute("UPDATE assignments SET status='done', submitted_at=?, result=? WHERE id=?",
                             (now(), json.dumps(result), aid))
             self.db.execute("UPDATE students SET xp=xp+?, last_submit=? WHERE id=?", (xp, now(), sid))
-        self.event("submit", correct=len(solved), total=len(a["items"]))
+        self.event("submit", correct=len(solved), total=len(solved) + len(mistakes))
         return self.result(sid, aid)
 
     def result(self, sid, aid):
@@ -646,8 +834,8 @@ class Service:
         return {"classrooms": rooms, "classroom": classroom, "students": students, "topics": topics,
                 "hardest": hard, "answered": tot["n"],
                 "accuracy": round(tot["ok"] / tot["n"], 2) if tot["n"] else None,
-                "bank": len(self.index), "embedder": self.embedder.name, "classifier": self.classifier.name,
-                "options_reader": options_mod.available(self.cfg["answer_zone_path"])}
+                "bank": len(self.index), "embedder": self.embedder.name + ("" if self.live else " (banco precalculado; textos nuevos aproximados)"), "classifier": self.classifier.name,
+                "options_reader": self.pipeline.available}
 
 
 def env_cfg():
@@ -685,3 +873,18 @@ def board_status(svc):
         "topics": svc.topics, "topic_avg": [round(avg.get(tp, 0), 2) for tp in svc.topics],
         "bank": len(svc.index), "event_seq": svc.event_seq, "events": list(svc.events)[-5:],
     }
+
+
+def reset_database(data_dir):
+    """Move app.db (and its WAL files) to data/backup/<timestamp>/; the next start seeds a fresh demo.
+    Returns the backup folder, or None if there was no database."""
+    import shutil
+    data = Path(data_dir)
+    files = [data / n for n in ("app.db", "app.db-wal", "app.db-shm") if (data / n).exists()]
+    if not files:
+        return None
+    dest = data / "backup" / dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    dest.mkdir(parents=True, exist_ok=True)
+    for f in files:
+        shutil.move(str(f), str(dest / f.name))
+    return str(dest)

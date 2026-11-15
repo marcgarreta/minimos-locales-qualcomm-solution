@@ -25,12 +25,20 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, help="override config.json port (default 80)")
     ap.add_argument("--dev", action="store_true", help="accept any Host header (no captive redirects)")
+    ap.add_argument("--reset-demo", action="store_true",
+                    help="move the database to data/backup/ and exit: the next start recreates the example classroom")
     a = ap.parse_args()
     if a.port:
         os.environ["EDU_PORT"] = str(a.port)
     if a.dev:
         os.environ["EDU_DEV"] = "1"
     cfg = load(os.environ.get("EDU_CONFIG"))
+    if a.reset_demo:
+        from app.service import reset_database
+        moved = reset_database(cfg["data_dir"])
+        print("database moved to " + (moved or "(there was none)") + "; restart the portal to recreate the demo",
+              flush=True)
+        return
     svc = Service(cfg)
     server = ThreadingHTTPServer(("0.0.0.0", cfg["port"]), make_handler(svc, WWW))
     server.daemon_threads = True

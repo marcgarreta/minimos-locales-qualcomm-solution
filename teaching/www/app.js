@@ -30,7 +30,7 @@ const SUB = {
   "Ages, weights and everyday quantities": "Edades, pesos y cantidades", "Calendar and clocks": "Calendario y relojes",
   "Money and prices": "Dinero y precios", "Speed, distance and time": "Velocidad, distancia y tiempo",
 };
-const ROLE = { refuerzo: "Refuerzo", practica: "Práctica", reto: "Reto" };
+const ROLE = { refuerzo: "Refuerzo", practica: "Práctica", reto: "Reto", pendiente: "Pendiente" };
 const LETTERS = ["A", "B", "C", "D", "E"];
 const ICON = {
   check: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>',
@@ -39,6 +39,7 @@ const ICON = {
   star: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2.8l2.8 5.9 6.4.8-4.7 4.4 1.2 6.4L12 17.2l-5.7 3.1 1.2-6.4L2.8 9.5l6.4-.8z"/></svg>',
   bolt: '<svg viewBox="0 0 24 24"><path fill="#f1b82d" d="M13.5 2L4 13.5h6.5L9.5 22 20 9.5h-6.6z"/></svg>',
   flame: '<svg viewBox="0 0 24 24"><path fill="#ff9a3c" d="M12 2s5.5 4.8 5.5 10.6A5.5 5.5 0 0112 18a5.5 5.5 0 01-5.5-5.4c0-2.4 1.2-4 2.4-5.1.1 1.7.8 3 2 3.6C10.7 7.6 12 2 12 2z"/><path fill="#ffd25f" d="M12 22a4 4 0 01-4-4c0-2.3 2-3.6 2.6-5.6.9 1.4 1.4 1.9 2.4 2.3.4-1 .7-1.6.8-2.7C15 13.6 16 15.6 16 18a4 4 0 01-4 4z"/></svg>',
+  zoom: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.5 15.5L21 21M10.5 7.5v6M7.5 10.5h6"/></svg>',
   close: '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>',
 };
 const BRAND = '<svg class="brand-mark" viewBox="0 0 32 32"><rect width="32" height="32" rx="8" fill="#fff"/><path d="M7 22l6-6 4 4 8-9" stroke="#008184" stroke-width="3.2" fill="none" stroke-linecap="round" stroke-linejoin="round"/><circle cx="25" cy="11" r="2.6" fill="#e47128"/></svg>';
@@ -68,7 +69,11 @@ async function api(path, opts = {}) {
     credentials: "same-origin",
   });
   const data = await res.json().catch(() => ({}));
-  if (res.status === 401 && !path.endsWith("/login")) { S.me = null; go("#/login"); }
+  if (res.status === 401 && !path.endsWith("/login") && path !== "/api/me") {
+    // only leave when the server confirms there is no session (a passing error must not log anyone out)
+    const me = await fetch("/api/me", { credentials: "same-origin" }).then((r) => r.json()).catch(() => ({ role: "?" }));
+    if (!me.role) { S.me = null; go("#/login"); }
+  }
   if (!res.ok) throw new Error(data.error || `Error ${res.status}`);
   return data;
 }
@@ -219,16 +224,331 @@ function unitPath(t, levels = 8) {
     </div>`;
 }
 
+// ---------------------------------------------------------------- problem pieces (statement, zoom, option tiles)
+const lvlQ = (p) => (p.num ? `${lvl(p.level)} · pregunta ${p.num}` : lvl(p.level));
+
+function zoomImage(src, alt = "") {
+  const o = document.createElement("div");
+  o.className = "zoom";
+  o.innerHTML = `<button class="zoom-x" aria-label="Cerrar">${ICON.close}</button>
+    <div class="zoom-scroll"><img src="${src}" alt="${esc(alt)}"></div>
+    <div class="zoom-hint">Desliza o pellizca para ver los detalles · toca fuera para cerrar</div>`;
+  const close = () => { o.remove(); document.removeEventListener("keydown", key); };
+  const key = (e) => { if (e.key === "Escape") { e.stopPropagation(); close(); } };
+  o.addEventListener("click", (e) => { if (!e.target.closest("img")) close(); });
+  document.addEventListener("keydown", key);
+  document.body.appendChild(o);
+}
+document.addEventListener("click", (e) => {
+  const z = e.target.closest("[data-zoom]");
+  if (z) { e.preventDefault(); zoomImage(z.dataset.zoom, z.dataset.alt || ""); }
+});
+
+/** The statement, once, as text; below it only the figure cut by the team's OCR (tap: the original
+    page). Problems without a figure show no picture; uncertain cuts fall back to the page itself. */
+function statement(p) {
+  const fig = p.figure;
+  const text = p.text ? `<p class="stmt-text">${esc(p.text)}</p>` : "";
+  if (!fig) return text;
+  return `${text}<button type="button" class="stmt-img${p.figure_fallback ? " page" : " fig"}" data-zoom="${p.image || fig}" data-alt="${esc(p.text || "")}" aria-label="Ampliar la figura">
+      <img src="${fig}" alt="Figura del problema" loading="lazy"><span class="zoom-badge">${ICON.zoom}</span></button>`;
+}
+
+/** The five options as square tiles: the printed option (text or drawing), else the OCR text, else the letter.
+    result = {given, answer} colours them after checking. */
+function tiles(p, { chosen = null, result = null, interactive = false, small = false } = {}) {
+  const tag = interactive ? "button" : "div";
+  return `<div class="tiles${small ? " sm" : ""}"${interactive ? ' role="radiogroup" aria-label="Opciones"' : ""}>${LETTERS.map((L) => {
+    const img = p.option_images && p.option_images[L], txt = p.options && p.options[L];
+    let cls = "tile", mark = "";
+    if (result) {
+      if (L === result.answer) { cls += " ok"; mark = ICON.check; }
+      else if (L === result.given) { cls += " ko"; mark = ICON.x; }
+      else cls += " dim";
+    } else if (chosen === L) cls += " sel";
+    const body = img ? `<img src="${img}" alt="${esc(txt || "Opción " + L)}" loading="lazy">`
+      : txt ? `<span class="tile-txt${txt.length > 7 ? " long" : ""}">${esc(txt)}</span>` : `<span class="tile-big">${L}</span>`;
+    const attrs = interactive ? ` type="button" data-l="${L}" role="radio" aria-checked="${chosen === L}" aria-label="Opción ${L}${txt ? ": " + esc(txt) : ""}"${result ? " disabled" : ""}` : "";
+    return `<${tag} class="${cls}"${attrs}><span class="tile-key">${L}</span>${body}${mark ? `<span class="tile-mark">${mark}</span>` : ""}</${tag}>`;
+  }).join("")}</div>`;
+}
+
+// ---------------------------------------------------------------- student: mission card, mission, lesson, result
 function missionCard(h) {
   const a = h.current;
   if (!a) return `<div class="card card-pad"><h2>Sin misión</h2><p class="muted">Tu profesor te asignará una pronto.</p></div>`;
+  const answered = a.items.filter((p) => p.given).length;
   return `<div class="card card-pad mission-hero">
     <div class="row" style="justify-content:space-between"><h2>${esc(a.title)}</h2><span class="chip" style="background:rgba(255,255,255,.18);color:#fff">${a.items.length} problemas</span></div>
-    <div class="muted small">Entrega: <b style="color:#fff">${fmtDate(a.due)}</b></div>
-    <div class="mini-list">${a.items.slice(0, 5).map((p, i) => `<div class="mini-item"><span class="dot">${i + 1}</span><span style="flex:1">${esc(tName(p.topic))} · ${lvl(p.level)}</span><span class="role ${p.role}">${ROLE[p.role]}</span></div>`).join("")}
+    <div class="muted small">Entrega: <b style="color:#fff">${fmtDate(a.due)}</b>${answered ? ` · ${answered} de ${a.items.length} respondidos` : ""}</div>
+    <div class="mini-list">${a.items.slice(0, 5).map((p, i) => `<div class="mini-item"><span class="dot">${p.given ? (p.correct ? "✓" : "✗") : i + 1}</span><span style="flex:1">${esc(tName(p.topic))} · ${lvl(p.level)}</span><span class="role ${p.role}">${ROLE[p.role] || ""}</span></div>`).join("")}
     ${a.items.length > 5 ? `<div class="small muted">+ ${a.items.length - 5} más</div>` : ""}</div>
-    <div class="stack" style="gap:10px"><a class="btn orange block" href="#/s/entregar">Entregar respuestas</a><a class="btn ghost block" href="#/s/mision">Ver problemas</a></div>
+    <div class="stack" style="gap:10px"><a class="btn orange block" href="#/s/entregar">${answered ? "Seguir respondiendo" : "Responder misión"}</a><a class="btn ghost block" href="#/s/mision">Ver problemas</a></div>
   </div>`;
+}
+
+async function viewMission() {
+  loading();
+  const h = await loadHome();
+  const a = h.current;
+  app().innerHTML = topbar(STUDENT_NAV) + `<main class="page">
+    ${!a ? '<div class="card empty">No tienes ninguna misión abierta.</div>' : `
+    <div class="page-head"><div><h1>${esc(a.title)}</h1><div class="muted">Resuélvelos en papel y vuelve con tus respuestas · Entrega ${fmtDate(a.due)}</div></div>
+      <span class="spacer"></span><a class="btn orange" href="#/s/entregar">Responder</a></div>
+    <div class="problem-list">${a.items.map((p, i) => `<article class="card problem-card">
+        <div class="num">${p.given ? (p.correct ? ICON.check : ICON.x) : i + 1}</div>
+        <div class="stack" style="gap:12px">
+          <div class="row"><span class="role ${p.role}">${ROLE[p.role] || ""}</span><span class="chip teal">${esc(tName(p.topic))}</span><span class="chip">${lvlQ(p)}</span>
+            ${p.because ? `<span class="small muted">Para preparar un problema que fallaste</span>` : ""}${p.role === "pendiente" ? `<span class="small muted">Lo saltaste la última vez</span>` : ""}</div>
+          ${statement(p)}
+          ${tiles(p, { small: true, result: p.given ? { given: p.given, answer: p.answer } : null })}
+        </div></article>`).join("")}</div>`}
+  </main>`;
+  bindShell();
+}
+
+async function viewAnswer() {
+  loading();
+  const h = await loadHome();
+  const a = h.current;
+  if (!a) return go("#/s");
+  const st = S.lesson && S.lesson.aid === a.id ? S.lesson
+    : (S.lesson = { aid: a.id, idx: null, chosen: null, skipped: new Set(), results: {} });
+  st.explained = st.explained || new Set();
+  for (const p of a.items) if (p.given && !st.results[p.id]) st.results[p.id] = { given: p.given, answer: p.answer, correct: p.correct };
+  const pending = (i) => !st.results[a.items[i].id] && !st.skipped.has(a.items[i].id);
+  const nextIdx = (from) => {
+    for (let k = 1; k <= a.items.length; k++) { const i = (from + k) % a.items.length; if (pending(i)) return i; }
+    return null;
+  };
+  if (st.idx == null || !a.items[st.idx] || (!pending(st.idx) && !st.results[a.items[st.idx].id])) st.idx = nextIdx(-1);
+  const xpFor = (p, ok) => 2 + (ok ? 10 : 0) + (ok && p.role === "reto" ? 5 : 0);
+
+  const finish = () => {
+    st.idx = null;
+    const answered = Object.keys(st.results).length, good = Object.values(st.results).filter((r) => r.correct).length;
+    const skipped = a.items.filter((p) => st.skipped.has(p.id));
+    app().innerHTML = `<div class="lesson"><div class="lesson-top"><a class="linkbtn" href="#/s" aria-label="Salir">${ICON.close}</a>
+        <div class="bar"><i style="width:100%"></i></div><b class="small">${a.items.length}/${a.items.length}</b></div>
+      <div class="lesson-body lesson-end pop">
+        <div class="score-ring">${ring(good, Math.max(answered, 1))}<b>${good}/${answered}</b></div>
+        <h1>${answered ? (skipped.length ? "Casi lista" : "¡Misión completada!") : "No has respondido ninguno"}</h1>
+        <p class="muted">${skipped.length ? `Has saltado ${skipped.length} problema${skipped.length > 1 ? "s" : ""}. Si entregas así, volverá${skipped.length > 1 ? "n" : ""} en tu próxima misión.` : "Entrega para ver cómo cambia tu nivel y tu próxima misión."}</p>
+        ${skipped.length ? `<div class="skipped-list">${skipped.map((p) => `<span class="chip">${esc(tName(p.topic))} · ${lvl(p.level)}</span>`).join("")}</div>` : ""}
+      </div>
+      <div class="lesson-foot"><div class="lesson-foot-in">
+        ${skipped.length ? `<button class="btn ghost" id="back">Volver a los saltados</button>` : "<span></span>"}
+        <button class="btn green" id="send" ${answered ? "" : "disabled"}>Entregar misión</button>
+      </div></div></div>`;
+    const back = $("#back");
+    if (back) back.onclick = () => { st.skipped.clear(); st.idx = nextIdx(-1); draw(); };
+    $("#send").onclick = async (e) => {
+      e.target.disabled = true;
+      try {
+        const r = await api("/api/student/submit", { body: { assignment_id: a.id, answers: {} } });
+        S.lesson = null; S.home = null;
+        go(`#/s/resultado/${r.id}`);
+      } catch (err) { toast(err.message); e.target.disabled = false; }
+    };
+  };
+
+  const draw = () => {
+    if (st.idx == null) return finish();
+    const p = a.items[st.idx], res = st.results[p.id];
+    const done = Object.keys(st.results).length + st.skipped.size;
+    app().innerHTML = `<div class="lesson">
+      <div class="lesson-top"><a class="linkbtn" href="#/s" aria-label="Salir">${ICON.close}</a>
+        <div class="bar" role="progressbar" aria-valuenow="${done}" aria-valuemin="0" aria-valuemax="${a.items.length}"><i style="width:${(done / a.items.length) * 100}%"></i></div>
+        <b class="small">${st.idx + 1}/${a.items.length}</b></div>
+      <div class="lesson-body">
+        <div class="row"><span class="role ${p.role}">${ROLE[p.role] || ""}</span><span class="chip teal">${esc(tName(p.topic))}</span><span class="chip">${lvlQ(p)}</span></div>
+        <h1>¿Qué respuesta te salió?</h1>
+        ${statement(p)}
+        ${tiles(p, { interactive: true, chosen: st.chosen, result: res })}
+      </div>
+      <div class="lesson-foot ${res ? (res.correct ? "is-ok" : "is-ko") : ""}"><div class="lesson-foot-in">
+        ${res ? `<div class="verdict"><span class="verdict-ico">${res.correct ? ICON.check : ICON.x}</span>
+              <div><b>${res.correct ? "¡Correcto!" : "No es correcta"}</b>
+              <span>${res.correct ? `+${xpFor(p, true)} XP` : `La respuesta era la ${res.answer}${p.options && p.options[res.answer] ? ` · ${esc(p.options[res.answer])}` : ""}`}</span>
+              ${res.correct ? "" : st.explained.has(p.id)
+                ? '<em class="expl-sent">✓ Explicación enviada: la revisamos en segundo plano</em>'
+                : '<button class="linkbtn expl-link" id="explain">✎ Explicar cómo lo hice <small>(opcional)</small></button>'}</div></div>
+              <button class="btn ${res.correct ? "green" : "red"}" id="go">Continuar</button>`
+          : `<button class="btn ghost" id="skip">Saltar</button>
+             <button class="btn" id="check" ${st.chosen ? "" : "disabled"}>Comprobar</button>`}
+      </div></div></div>`;
+    $$(".tile[data-l]").forEach((b) => (b.onclick = () => { if (!res) { st.chosen = b.dataset.l; draw(); } }));
+    const check = $("#check"), skip = $("#skip"), go_ = $("#go");
+    if (check) check.onclick = async () => {
+      check.disabled = true;
+      try {
+        const r = await api("/api/student/check", { body: { assignment_id: a.id, problem_id: p.id, answer: st.chosen } });
+        st.results[p.id] = r; st.chosen = null; draw();
+        if (!r.correct) { const t = $(".tile.ko"); if (t) t.classList.add("shake"); }
+      } catch (e) { toast(e.message); check.disabled = false; }
+    };
+    if (skip) skip.onclick = () => { st.skipped.add(p.id); st.chosen = null; st.idx = nextIdx(st.idx); draw(); };
+    if (go_) { go_.onclick = () => { st.idx = nextIdx(st.idx); draw(); }; go_.focus(); }
+    const explain = $("#explain");
+    if (explain) explain.onclick = () => explainModal(a.id, p, () => { st.explained.add(p.id); draw(); });
+  };
+
+  // keyboard: A-E or 1-5 choose, Enter checks / continues, S skips
+  S.lessonKey = (e) => {
+    if (e.target.closest && e.target.closest("input,textarea") || document.querySelector(".zoom")) return;
+    const k = e.key.toUpperCase();
+    const L = LETTERS.includes(k) ? k : "12345".includes(k) && k.length === 1 ? LETTERS[Number(k) - 1] : null;
+    if (L && $(`.tile[data-l="${L}"]:not([disabled])`)) { $(`.tile[data-l="${L}"]`).click(); return; }
+    if (e.key === "Enter") { const b = $("#go") || $("#check:not([disabled])") || $("#send:not([disabled])"); if (b) { e.preventDefault(); b.click(); } }
+    if (k === "S" && $("#skip")) $("#skip").click();
+  };
+  draw();
+}
+
+// ---- optional "how did you solve it?" on a wrong answer. The board's LLM checks the NUMBERS in the background
+// (calculation slips only: a surprising digit = probably a wrong result; it can't judge the reasoning).
+const explUrl = (aid) => `/api/student/assignments/${aid}/explanations`;
+const EXPL_HELP = "Revisaremos los números que escribas (no el razonamiento). Tarda un poco: se hace en segundo plano.";
+const EXPL_PH = "Por ejemplo: 3 cajas de 4 son 3 x 4 = 12, menos 2 son 10…";
+
+function explainModal(aid, p, onSent) {
+  const m = modal(`<h2>¿Cómo lo resolviste?</h2>
+    <p class="small muted" style="margin-top:-4px">Escribe tus pasos y tus cuentas. ${EXPL_HELP}</p>
+    <textarea id="expl-ta" maxlength="2000" placeholder="${EXPL_PH}"></textarea>
+    <div class="row" style="margin-top:10px;justify-content:flex-end"><button class="btn ghost sm" id="expl-no">Ahora no</button><button class="btn sm" id="expl-go">Revisar mis cálculos</button></div>`);
+  const ta = $("#expl-ta", m.el); ta.focus();
+  $("#expl-no", m.el).onclick = () => m.close();
+  $("#expl-go", m.el).onclick = async (e) => {
+    if (!ta.value.trim()) return toast("Escribe cómo lo resolviste");
+    e.target.disabled = true;
+    try {
+      await api(explUrl(aid), { body: { problem_id: p.id, text: ta.value.trim() } });
+      m.close(); toast("Enviada. Verás la revisión en la corrección de la misión."); onSent();
+    } catch (err) { toast(err.message); e.target.disabled = false; }
+  };
+}
+
+function markNumbers(text, numbers) {
+  let out = "", at = 0;
+  for (const n of numbers) {
+    out += esc(text.slice(at, n.start));
+    out += `<span class="${n.flag ? "num-bad" : "num-ok"}" title="${n.flag ? "Revisa este cálculo" : "Parece correcto"}">${esc(text.slice(n.start, n.end))}</span>`;
+    at = n.end;
+  }
+  return out + esc(text.slice(at));
+}
+
+function explBlock(p, ex) {
+  const pid = esc(p.id);
+  if (!ex) return `<div class="expl" data-pid="${pid}">
+      <button class="linkbtn small expl-open">✎ Explicar cómo lo hice <span class="muted">(opcional)</span></button></div>`;
+  const head = '<div class="small muted" style="margin-bottom:6px">Tu explicación</div>';
+  if (ex.status === "pending") return `<div class="expl" data-pid="${pid}">${head}<div class="expl-text">${esc(ex.text)}</div>
+      <div class="row small muted expl-wait"><span class="spin sm"></span>Revisando tus cálculos en segundo plano… puedes seguir navegando.</div></div>`;
+  if (ex.status === "done") {
+    const res = ex.result, bad = res.flagged;
+    return `<div class="expl" data-pid="${pid}">${head}<div class="expl-text">${markNumbers(ex.text, res.numbers)}</div>
+      <div class="expl-msg ${bad ? "bad" : "ok"}">${bad
+        ? `Revisa ${bad === 1 ? "el número marcado" : `los ${bad} números marcados`} en rojo: puede que haya un error de cálculo.`
+        : res.numbers.length ? "No vemos errores en tus cuentas. Si fallaste, revisa el razonamiento o el planteamiento."
+          : "No hay números que revisar. Solo comprobamos cálculos, no el razonamiento."}</div>
+      <button class="linkbtn small expl-open">Editar explicación</button></div>`;
+  }
+  const msg = ex.status === "off" ? "La revisión automática no está disponible en esta placa." : esc((ex.result || {}).error || "No se pudo analizar.");
+  return `<div class="expl" data-pid="${pid}">${head}<div class="expl-text">${esc(ex.text)}</div>
+    <div class="expl-msg">${msg}</div>${ex.status === "error" ? '<button class="linkbtn small expl-retry">Reintentar</button>' : ""}</div>`;
+}
+
+function bindExplanations(aid, items, ex) {
+  const hash = location.hash;
+  const find = (pid) => $$(".expl").find((el) => el.dataset.pid === pid);
+  const redraw = (pid) => {
+    const el = find(pid);
+    if (el) el.outerHTML = explBlock(items.find((p) => p.id === pid), ex[pid]);
+    bindOne(pid);
+  };
+  const send = async (pid, text, btn) => {
+    if (btn) btn.disabled = true;
+    try { Object.assign(ex, await api(explUrl(aid), { body: { problem_id: pid, text } })); redraw(pid); poll(); }
+    catch (e) { toast(e.message); if (btn) btn.disabled = false; }
+  };
+  const bindOne = (pid) => {
+    const el = find(pid);
+    if (!el) return;
+    const open = $(".expl-open", el), retry = $(".expl-retry", el);
+    if (retry) retry.onclick = () => send(pid, ex[pid].text, retry);
+    if (open) open.onclick = () => {
+      el.innerHTML = `<label class="f small">¿Cómo lo resolviste? Escribe tus pasos y tus cuentas.
+          <textarea maxlength="2000" placeholder="${EXPL_PH}">${esc((ex[pid] || {}).text || "")}</textarea></label>
+        <div class="small muted">${EXPL_HELP}</div>
+        <div class="row" style="margin-top:8px"><button class="btn sm expl-send">Revisar mis cálculos</button><button class="btn sm ghost expl-cancel">Cancelar</button></div>`;
+      const ta = $("textarea", el); ta.focus();
+      $(".expl-cancel", el).onclick = () => redraw(pid);
+      $(".expl-send", el).onclick = (e) => { if (ta.value.trim()) send(pid, ta.value.trim(), e.target); else toast("Escribe cómo lo resolviste"); };
+    };
+  };
+  let timer = null;
+  const poll = () => {
+    clearTimeout(timer);
+    if (!Object.values(ex).some((e) => e.status === "pending")) return;
+    timer = setTimeout(async () => {
+      if (location.hash !== hash) return;
+      try {
+        const fresh = await api(explUrl(aid));
+        for (const [pid, e] of Object.entries(fresh)) {
+          const was = ex[pid] && ex[pid].status; ex[pid] = e;
+          const el = find(pid);
+          if (was !== e.status && !(el && $("textarea", el))) redraw(pid);
+        }
+      } catch (e) { /* keep polling */ }
+      poll();
+    }, 3000);
+  };
+  items.forEach((p) => bindOne(p.id));
+  poll();
+}
+
+async function viewResult(id) {
+  loading();
+  const [r, h, ex] = await Promise.all([api(`/api/student/results/${id}`), loadHome(),
+    api(explUrl(id)).catch(() => ({}))]);
+  const res = r.result;
+  const wrong = r.items.filter((p) => p.given && !p.correct);
+  const skippedN = (res.skipped || []).length;
+  const pct = res.total ? res.correct / res.total : 0;
+  app().innerHTML = topbar(STUDENT_NAV) + `<main class="page">
+    <div class="grid-main">
+      <div class="stack">
+        <section class="card result-hero pop">
+          <div class="score-ring">${ring(res.correct, res.total)}<b>${res.correct}/${res.total}</b></div>
+          <h1>${res.total && res.correct === res.total ? "¡Perfecto!" : pct >= 0.6 ? "¡Buen trabajo!" : "Sigue practicando"}</h1>
+          <p class="muted">${esc(r.title)} · entregada ${fmtDate(r.submitted_at)}${skippedN ? ` · ${skippedN} saltado${skippedN > 1 ? "s" : ""}` : ""}</p>
+          <span class="xp-gain">${ICON.bolt.replace("<svg", '<svg width="20" height="20"')} +${res.xp} XP</span>
+        </section>
+        ${wrong.length ? `<section class="card card-pad"><h2>Antes de volver a intentarlo</h2>
+          <p class="muted small" style="margin-top:-6px">Problemas parecidos y un poco más sencillos para preparar los que fallaste. Ya están en tu próxima misión.</p>
+          ${wrong.map((p) => `<div class="prereq"><div class="row"><b>${esc(tName(p.topic))} · ${lvlQ(p)}</b><span class="chip red">Marcaste ${p.given} · era ${p.answer}</span></div>
+            <div class="prereq-items">${(r.prereq_problems[p.id] || []).map((q) => `<button type="button" class="thumb" data-zoom="${q.image || ""}" data-alt="${esc(q.text || "")}">${q.figure ? `<img src="${q.figure}" alt="">` : ""}<span><b>${lvlQ(q)}</b> · ${esc(sub(q.subtopic))}</span></button>`).join("") || '<span class="small muted">No hay problemas más sencillos de este tipo.</span>'}</div></div>`).join("")}
+          </section>` : ""}
+        <section class="card card-pad"><h2>Corrección</h2>
+          ${r.items.map((p, i) => { const sk = !p.given; return `<div class="answer-row">
+            <span class="tick ${sk ? "skip" : p.correct ? "ok" : "ko"}">${sk ? "–" : p.correct ? ICON.check : ICON.x}</span>
+            <div><b>${i + 1}. ${esc(tName(p.topic))}</b> <span class="muted small">${lvlQ(p)} · ${esc(sub(p.subtopic))}</span></div>
+            <span class="mono small">${sk ? "saltado" : p.given + (p.correct ? "" : ` → ${p.answer}`)}</span></div>
+            ${!sk && !p.correct ? explBlock(p, ex[p.id]) : ""}`; }).join("")}
+        </section>
+      </div>
+      <aside class="stack">
+        <div class="card card-pad"><h2>Cómo has cambiado</h2>
+          ${res.changes.map((c) => { const up = c.after >= c.before; return `<div style="margin-bottom:12px"><div class="row" style="justify-content:space-between"><b class="small">${esc(tName(c.topic))}</b>
+            <span class="small ${up ? "delta-up" : "delta-down"}">${up ? "▲" : "▼"} ${lvl(Math.floor(c.after))}</span></div>
+            <div class="lvbar" style="margin-top:6px"><i style="width:${(c.after / 8) * 100}%;background:${up ? "var(--teal)" : "var(--orange)"}"></i><em style="left:${(c.before / 8) * 100}%;background:var(--muted)" title="antes"></em></div></div>`; }).join("")}
+        </div>
+        ${h.current ? missionCard(h) : ""}
+      </aside>
+    </div></main>`;
+  bindShell();
+  bindExplanations(r.id, wrong, ex);
 }
 
 async function viewStudentPath() {
@@ -252,113 +572,6 @@ async function viewStudentPath() {
           <div class="legend" style="justify-content:center;margin-top:6px"><span><i style="background:#008184"></i>Tú</span><span><i style="background:#e47128"></i>Media del aula</span></div>
         </div>
         ${h.last_result_id ? `<a class="btn ghost block" href="#/s/resultado/${h.last_result_id}">Ver último resultado</a>` : ""}
-      </aside>
-    </div></main>`;
-  bindShell();
-}
-
-function problemBody(p, i) {
-  const opts = Object.keys(p.options || {}).length === 5 && !p.image
-    ? `<div class="row small" style="margin-top:8px">${LETTERS.map((l) => `<span class="chip">${l}) ${esc(p.options[l])}</span>`).join("")}</div>` : "";
-  if (!p.image) return `<div class="problem-text">${esc(p.text)}</div>${opts}`;
-  // On phones the scanned page is too small to read: show the text too, and let the image scroll / open full size.
-  return `${p.text ? `<div class="problem-text only-sm">${esc(p.text)}</div>` : ""}
-    <a class="img-scroll" href="${p.image}" target="_blank" rel="noopener" title="Ver a tamaño completo"><img class="problem-img" src="${p.image}" alt="Problema ${i + 1}" loading="lazy"></a>
-    <div class="only-sm small muted">Desliza la imagen o tócala para ampliarla</div>`;
-}
-
-async function viewMission() {
-  loading();
-  const h = await loadHome();
-  const a = h.current;
-  app().innerHTML = topbar(STUDENT_NAV) + `<main class="page">
-    ${!a ? '<div class="card empty">No tienes ninguna misión abierta.</div>' : `
-    <div class="page-head"><div><h1>${esc(a.title)}</h1><div class="muted">Resuélvelos en papel y vuelve con tus respuestas · Entrega ${fmtDate(a.due)}</div></div>
-      <span class="spacer"></span><a class="btn orange" href="#/s/entregar">Entregar respuestas</a></div>
-    <div class="problem-list">${a.items.map((p, i) => `<article class="card problem-card">
-        <div class="num">${i + 1}</div>
-        <div class="stack" style="gap:10px">
-          <div class="row"><span class="role ${p.role}">${ROLE[p.role]}</span><span class="chip teal">${esc(tName(p.topic))}</span><span class="chip">${lvl(p.level)}</span>
-            ${p.because ? `<span class="small muted">Prepara un problema que fallaste</span>` : ""}</div>
-          ${problemBody(p, i)}
-        </div></article>`).join("")}</div>`}
-  </main>`;
-  bindShell();
-}
-
-async function viewAnswer() {
-  if (!S.home || !S.home.current) await loadHome();
-  const a = S.home.current;
-  if (!a) return go("#/s");
-  const ans = (S.answers[a.id] = S.answers[a.id] || {});
-  S.step = Math.min(S.step, a.items.length - 1);
-  const draw = () => {
-    const i = S.step, p = a.items[i], chosen = ans[p.id];
-    const hasOpts = Object.keys(p.options || {}).length > 0;
-    app().innerHTML = `<div class="lesson">
-      <div class="lesson-top"><a class="linkbtn" href="#/s" aria-label="Salir">${ICON.close}</a>
-        <div class="bar" role="progressbar" aria-valuenow="${i + 1}" aria-valuemax="${a.items.length}"><i style="width:${(Object.keys(ans).length / a.items.length) * 100}%"></i></div>
-        <b class="small">${i + 1}/${a.items.length}</b></div>
-      <div class="lesson-body">
-        <div class="row"><span class="role ${p.role}">${ROLE[p.role]}</span><span class="chip teal">${esc(tName(p.topic))}</span><span class="chip">${lvl(p.level)}</span></div>
-        <h1>¿Qué respuesta marcaste?</h1>
-        ${problemBody(p, i)}
-        <div class="choices">${LETTERS.map((l) => `<button class="choice ${chosen === l ? "sel" : ""}" data-l="${l}"><b>${l}</b>${hasOpts && p.options[l] ? `<span>${esc(p.options[l])}</span>` : ""}</button>`).join("")}</div>
-      </div>
-      <div class="lesson-foot"><div class="lesson-foot-in">
-        <button class="btn ghost" id="prev" ${i === 0 ? "disabled" : ""}>Anterior</button>
-        ${i < a.items.length - 1
-          ? `<button class="btn" id="next" ${chosen ? "" : "disabled"}>Siguiente</button>`
-          : `<button class="btn green" id="send" ${Object.keys(ans).length === a.items.length ? "" : "disabled"}>Entregar</button>`}
-      </div></div></div>`;
-    $$(".choice").forEach((b) => (b.onclick = () => { ans[p.id] = b.dataset.l; draw(); }));
-    const prev = $("#prev"), next = $("#next"), send = $("#send");
-    prev.onclick = () => { S.step--; draw(); };
-    if (next) next.onclick = () => { S.step++; draw(); };
-    if (send) send.onclick = async () => {
-      send.disabled = true;
-      try {
-        const r = await api("/api/student/submit", { body: { assignment_id: a.id, answers: ans } });
-        delete S.answers[a.id]; S.step = 0; S.home = null;
-        go(`#/s/resultado/${r.id}`);
-      } catch (e) { toast(e.message); send.disabled = false; }
-    };
-  };
-  draw();
-}
-
-async function viewResult(id) {
-  loading();
-  const [r, h] = await Promise.all([api(`/api/student/results/${id}`), loadHome()]);
-  const res = r.result;
-  const wrong = r.items.filter((p) => !p.correct);
-  app().innerHTML = topbar(STUDENT_NAV) + `<main class="page">
-    <div class="grid-main">
-      <div class="stack">
-        <section class="card result-hero pop">
-          <div class="score-ring">${ring(res.correct, res.total)}<b>${res.correct}/${res.total}</b></div>
-          <h1>${res.correct === res.total ? "¡Perfecto!" : res.correct / res.total >= 0.6 ? "¡Buen trabajo!" : "Sigue practicando"}</h1>
-          <p class="muted">${esc(r.title)} · entregada ${fmtDate(r.submitted_at)}</p>
-          <span class="xp-gain">${ICON.bolt.replace("<svg", '<svg width="20" height="20"')} +${res.xp} XP</span>
-        </section>
-        ${wrong.length ? `<section class="card card-pad"><h2>Antes de volver a intentarlo</h2>
-          <p class="muted small" style="margin-top:-6px">Problemas parecidos pero más sencillos para preparar los que fallaste.</p>
-          ${wrong.map((p) => `<div class="prereq"><div class="row"><b>${esc(tName(p.topic))} · ${lvl(p.level)}</b><span class="chip red">Marcaste ${p.given} · era ${p.answer}</span></div>
-            <div class="prereq-items">${(r.prereq_problems[p.id] || []).map((q) => `<div class="thumb">${q.image ? `<img src="${q.image}" alt="">` : ""}<b>${lvl(q.level)}</b> · ${esc(sub(q.subtopic))}</div>`).join("") || '<span class="small muted">No hay problemas más sencillos de este tipo.</span>'}</div></div>`).join("")}
-          <p class="small muted">Ya están en tu próxima misión.</p></section>` : ""}
-        <section class="card card-pad"><h2>Corrección</h2>
-          ${r.items.map((p, i) => `<div class="answer-row"><span class="tick ${p.correct ? "ok" : "ko"}">${p.correct ? ICON.check : ICON.x}</span>
-            <div><b>${i + 1}. ${esc(tName(p.topic))}</b> <span class="muted small">${lvl(p.level)} · ${esc(sub(p.subtopic))}</span></div>
-            <span class="mono small">${p.given}${p.correct ? "" : ` → ${p.answer}`}</span></div>`).join("")}
-        </section>
-      </div>
-      <aside class="stack">
-        <div class="card card-pad"><h2>Cómo has cambiado</h2>
-          ${res.changes.map((c) => { const up = c.after >= c.before; return `<div style="margin-bottom:12px"><div class="row" style="justify-content:space-between"><b class="small">${esc(tName(c.topic))}</b>
-            <span class="small ${up ? "delta-up" : "delta-down"}">${up ? "▲" : "▼"} ${lvl(Math.floor(c.after))}</span></div>
-            <div class="lvbar" style="margin-top:6px"><i style="width:${(c.after / 8) * 100}%;background:${up ? "var(--teal)" : "var(--orange)"}"></i><em style="left:${(c.before / 8) * 100}%;background:var(--muted)" title="antes"></em></div></div>`; }).join("")}
-        </div>
-        ${h.current ? missionCard(h) : ""}
       </aside>
     </div></main>`;
   bindShell();
@@ -479,8 +692,8 @@ function levelOptions(sel, first = "Todos los niveles") {
 }
 function pcard(p) {
   return `<article class="card pcard" data-id="${esc(p.id)}">
-    ${p.image ? `<img src="${p.image}" alt="" loading="lazy">` : ""}
-    <div class="row"><span class="chip teal">${esc(tName(p.topic))}</span><span class="chip">${lvl(p.level)}</span>${p.source === "profe" ? '<span class="chip gold">Tuyo</span>' : ""}</div>
+    ${p.figure ? `<div class="pcard-img"><img src="${p.figure}" alt="" loading="lazy"></div>` : ""}
+    <div class="row"><span class="chip teal">${esc(tName(p.topic))}</span><span class="chip">${lvlQ(p)}</span>${p.source === "profe" ? '<span class="chip gold">Tuyo</span>' : ""}</div>
     <div class="txt">${esc(p.text) || "<i>Solo imagen</i>"}</div>
     <div class="row small muted" style="justify-content:space-between"><span class="mono">${esc(p.id)}</span><span>Respuesta <b>${p.answer}</b></span></div></article>`;
 }
@@ -523,18 +736,17 @@ async function viewTeacherProblems() {
 
 async function problemModal(id) {
   const [p, sim] = await Promise.all([api(`/api/problems/${encodeURIComponent(id)}`), api(`/api/problems/${encodeURIComponent(id)}/similar`)]);
-  const opts = Object.keys(p.options || {}).length;
-  modal(`<div class="row"><h2 class="mono">${esc(p.id)}</h2><span class="chip teal">${esc(tName(p.topic))}</span><span class="chip">${esc(sub(p.subtopic))}</span><span class="chip">${lvl(p.level)}</span></div>
+  const m = modal(`<div class="row"><h2 class="mono">${esc(p.id)}</h2><span class="chip teal">${esc(tName(p.topic))}</span><span class="chip">${esc(sub(p.subtopic))}</span><span class="chip">${lvlQ(p)}</span></div>
     <div class="stack" style="margin-top:14px">
-      ${p.image ? `<img class="problem-img" src="${p.image}" alt="">` : ""}
-      ${p.text ? `<div class="problem-text">${esc(p.text)}</div>` : ""}
-      <div class="row">${LETTERS.map((l) => `<span class="chip ${l === p.answer ? "ahead" : ""}">${l}${opts ? ") " + esc(p.options[l] || "?") : ""}${l === p.answer ? " ✓" : ""}</span>`).join("")}</div>
+      ${statement(p)}
+      ${tiles(p, { small: true, result: { answer: p.answer, given: null } })}
       ${p.auto_topic ? `<div class="auto-box">Clasificación automática: <b>${esc(tName(p.auto_topic))}</b> (${pct(p.auto_confidence)})</div>` : ""}
-      <h3>Problemas parecidos (embeddings)</h3>
-      <div class="pgrid">${sim.map((q) => `<div class="card pcard" style="cursor:default">${q.image ? `<img src="${q.image}" alt="">` : ""}
-        <div class="row"><span class="chip teal">${esc(tName(q.topic))}</span><span class="chip">${lvl(q.level)}</span><span class="chip gold">${num(q.score, 2)}</span></div>
-        <div class="txt">${esc(q.text)}</div></div>`).join("")}</div>
+      <h3>Problemas parecidos (Qwen3-Embedding)</h3>
+      <div class="pgrid">${sim.map((q) => `<article class="card pcard" data-id="${esc(q.id)}">${q.figure ? `<div class="pcard-img"><img src="${q.figure}" alt="" loading="lazy"></div>` : ""}
+        <div class="row"><span class="chip teal">${esc(tName(q.topic))}</span><span class="chip">${lvlQ(q)}</span><span class="chip gold">${num(q.score, 2)}</span></div>
+        <div class="txt">${esc(q.text)}</div></article>`).join("")}</div>
     </div>`);
+  $$(".pcard[data-id]", m.el).forEach((c) => (c.onclick = () => { m.el.remove(); problemModal(c.dataset.id); }));
 }
 
 function newProblemModal() {
@@ -566,11 +778,18 @@ function newProblemModal() {
     const t = $("#ptopic").value;
     $("#psub").innerHTML = '<option value="">Automático</option>' + (t ? S.tax.taxonomy[t].map((s) => `<option value="${esc(s)}">${esc(sub(s))}</option>`).join("") : "");
   };
+  let asked = 0;
   const classify = async () => {
-    const text = $("#pt").value.trim();
+    const pt = $("#pt");
+    const text = pt ? pt.value.trim() : "";
     if (!text) return;
-    const r = await api("/api/classify", { body: { text, topic: $("#ptopic").value } });
-    $("#auto").innerHTML = `<div>Clasificación automática</div><div><b>${esc(tName(r.topic))}</b> › ${esc(sub(r.subtopic))} · <b>${lvl(r.level)}</b></div>
+    const mine = ++asked;
+    let r;
+    try { r = await api("/api/classify", { body: { text, topic: $("#ptopic").value } }); }
+    catch (e) { return; }                                    // the form still works without the suggestion
+    const box = $("#auto");
+    if (!box || mine !== asked) return;                      // form closed, or a newer text was sent meanwhile
+    box.innerHTML = `<div>Clasificación automática</div><div><b>${esc(tName(r.topic))}</b> › ${esc(sub(r.subtopic))} · <b>${lvl(r.level)}</b></div>
       <div class="small muted">Confianza ${pct(r.confidence)} · según los ${r.neighbors.length ? 15 : 0} problemas más parecidos del banco</div>`;
   };
   $("#pt").oninput = () => { clearTimeout(timer); timer = setTimeout(classify, 450); };
@@ -683,4 +902,5 @@ async function render() {
   }
 }
 window.addEventListener("hashchange", render);
+document.addEventListener("keydown", (e) => { if (location.hash.startsWith("#/s/entregar") && S.lessonKey) S.lessonKey(e); });
 render();

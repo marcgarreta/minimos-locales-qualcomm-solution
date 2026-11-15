@@ -51,7 +51,7 @@ def make_service(tmp):
     cfg = {"school_name": "Test", "teacher": {"user": "profe", "password": "pw", "name": "Profe"},
            "portal_ip": "192.168.4.1", "port": 0, "dev": True, "data_dir": str(Path(tmp) / "data"),
            "seed_dir": str(seed), "embedder": {"kind": "hash", "dim": 64}, "classifier": "knn",
-           "answer_zone_path": str(Path(tmp) / "nope"), "initial_problems": 6, "weekend_problems": 8,
+           "initial_problems": 6, "weekend_problems": 8,
            "max_prerequisites_per_mistake": 2, "levels": 8}
     return Service(cfg, rng=random.Random(1))
 
@@ -164,6 +164,31 @@ class ServiceTest(unittest.TestCase):
         svc2.db.close()
         svc3.db.close()
 
+    def test_check_locks_the_answer_and_skipped_come_back(self):
+        s = self.svc.add_student({"name": "Ana", "classroom": "4A", "start_level": 2})
+        a = self.svc.student_home(s["id"])["current"]
+        first, second = a["items"][0], a["items"][1]
+        right = self.svc.problem(first["id"])["answer"]
+        wrong = "A" if right != "A" else "B"
+        r = self.svc.check(s["id"], {"assignment_id": a["id"], "problem_id": first["id"], "answer": wrong})
+        self.assertEqual((r["correct"], r["answer"]), (False, right))
+        r = self.svc.check(s["id"], {"assignment_id": a["id"], "problem_id": first["id"], "answer": right})
+        self.assertFalse(r["correct"])                                   # can't change it after seeing red
+        home = self.svc.student_home(s["id"])["current"]
+        self.assertEqual(home["items"][0]["answer"], right)              # revealed only once checked
+        self.assertNotIn("answer", home["items"][1])
+        self.svc.check(s["id"], {"assignment_id": a["id"], "problem_id": second["id"], "answer": "C"})
+        res = self.svc.submit(s["id"], {"assignment_id": a["id"], "answers": {}})   # the rest skipped
+        self.assertEqual(res["result"]["total"], 2)
+        self.assertEqual(len(res["result"]["skipped"]), len(a["items"]) - 2)
+        nxt = self.svc.student_home(s["id"])["current"]
+        pend = [i["id"] for i in nxt["items"] if i["role"] == "pendiente"]
+        self.assertEqual(sorted(pend), sorted(res["result"]["skipped"]))
+        n = self.svc.db.execute("SELECT COUNT(*) FROM attempts WHERE student_id=?", (s["id"],)).fetchone()[0]
+        self.assertEqual(n, 2)                                           # skipped ones aren't graded
+        with self.assertRaises(ApiError):                                # nothing answered: can't hand in
+            self.svc.submit(s["id"], {"assignment_id": nxt["id"], "answers": {}})
+
     def test_board_status_counts_without_personal_data(self):
         s = self.svc.add_student({"name": "Ana Pérez", "classroom": "4A", "start_level": 1})
         self.svc.login({"role": "student", "code": s["id"]})
@@ -213,12 +238,239 @@ class ServiceTest(unittest.TestCase):
         self.assertNotIn("answer", p)
         self.assertIn(p["status"], ("solved", "failed"))
 
+    def test_demo_student_has_a_fixed_mission_and_reset_recreates_it(self):
+        from app import demo
+        from app.service import reset_database
+        ids = sorted(self.svc._meta)[:5]
+        self.svc.cfg["demo_students"] = True
+        self.svc.db.close()
+        reset_database(self.svc.cfg["data_dir"])                      # what server.py --reset-demo does
+        old = demo.DEMO_MISSION
+        demo.DEMO_MISSION = ids                                       # the real ids aren't in the fake bank
+        try:
+            svc = Service(self.svc.cfg)
+            a = svc.student_home("DEM-123")["current"]
+            self.assertEqual([p["id"] for p in a["items"]], ids)       # always the same problems, same order
+            self.assertEqual(a["title"], "Misión de demostración")
+            self.assertEqual(len(svc.list_students()), 6)
+            svc.check("DEM-123", {"assignment_id": a["id"], "problem_id": ids[0], "answer": "A"})
+            svc.db.close()
+            backup = reset_database(svc.cfg["data_dir"])
+            self.assertTrue(Path(backup, "app.db").exists())
+            svc = Service(self.svc.cfg)                               # fresh again: nothing answered
+            a = svc.student_home("DEM-123")["current"]
+            self.assertTrue(all(p["given"] is None for p in a["items"]))
+            svc.db.close()
+        finally:
+            demo.DEMO_MISSION = old
+            self.svc = Service(self.svc.cfg)                          # tearDown closes it
+
+    def test_bank_problem_shows_text_figure_and_option_crops(self):
+        pid = sorted(self.svc._meta)[0]
+        self.svc.figures = {pid: {"figure": f"multimodal/{pid}/question.png", "fallback": False,
+                                  "options": {L: f"multimodal/{pid}/{L}.png" for L in "ABCDE"},
+                                  "texts": {L: f"{L}!" for L in "ABCDE"}, "mode": "diagram_and_option_crops"}}
+        p = self.svc.problem(pid)
+        self.assertEqual(p["figure"], f"/media/seed/multimodal/{pid}/question.png")
+        self.assertEqual(p["option_images"]["C"], f"/media/seed/multimodal/{pid}/C.png")
+        self.assertEqual(p["options"]["A"], "A!")                       # the team's OCR text
+        self.assertTrue(p["text"])                                      # the statement stays text
+        crop = Path(self.svc.seed_dir) / "multimodal" / pid / "question.png"
+        crop.parent.mkdir(parents=True)
+        crop.write_bytes(b"png")
+        self.assertEqual(self.svc.media_path(f"seed/multimodal/{pid}/question.png"), crop)
+        for bad in ("seed/../app.db", "app.db", "seed/../../x", "/etc/passwd"):
+            self.assertIsNone(self.svc.media_path(bad))
+
+    def test_teacher_photo_goes_through_the_pipeline(self):
+        calls = []
+
+        class FakePipeline:
+            available = True
+
+            def process(self, pid, data, text, level, answer, out):
+                calls.append((pid, text, answer, Path(out).name))
+                return {"figure": f"ocr/multimodal/{pid}/question.png", "fallback": False, "options": {},
+                        "texts": {L: str(i) for i, L in enumerate("ABCDE")}, "mode": "diagram_with_text_options"}
+        self.svc.pipeline = FakePipeline()
+        png = "data:image/png;base64," + __import__("base64").b64encode(b"\x89PNG fake").decode()
+        p = self.svc.add_problem({"text": "Solve the equation x plus 3 equals 10", "answer": "C", "image": png})
+        self.assertEqual(calls, [(p["id"], "Solve the equation x plus 3 equals 10", "C", "ocr")])
+        self.assertEqual(p["figure"], f"/media/ocr/multimodal/{p['id']}/question.png")
+        self.assertEqual(p["options"]["B"], "1")                        # read from the photo
+
+    @unittest.skipUnless((ROOT / "seed/images/lvl-0_2016_16.png").exists(), "needs the local M3Kang bank")
+    def test_real_pipeline_cuts_the_figure(self):
+        from app.figures import Pipeline
+        pipe = Pipeline(ROOT / "ocr_handoff")
+        if not pipe.available:
+            self.skipTest(pipe.error)
+        data = (ROOT / "seed/images/lvl-0_2016_16.png").read_bytes()
+        out = Path(self.tmp.name) / "ocr"
+        d = pipe.process("t1", data, "From a rectangle measuring 15 x 9 cm, we cut out a square with a perimeter "
+                         "of 8 cm from each vertex. What is the perimeter of the resulting figure?", 0, "A", out)
+        self.assertEqual(d["figure"], "ocr/multimodal/t1/question.png")
+        self.assertEqual(d["texts"], {"A": "48 cm", "B": "40 cm", "C": "32 cm", "D": "24 cm", "E": "16 cm"})
+        from PIL import Image
+        self.assertLess(Image.open(out / "multimodal/t1/question.png").width, 400)   # the figure, not the page
+
     def test_add_problem_is_classified_and_searchable(self):
         p = self.svc.add_problem({"text": "Solve the equation: x plus 3 equals 10, find the unknown x", "answer": "c"})
         self.assertEqual(p["topic"], "Algebra")
         self.assertEqual(p["answer"], "C")
         sim = self.svc.similar(p["id"])
         self.assertTrue(sim and sim[0]["topic"] == "Algebra")
+
+
+class FakeScorer:
+    """Qwen-like tokens (one digit per token); only the 4 of '54' is surprising (7 x 8 = 56)."""
+    def __init__(self, text):
+        self.text = text
+
+    def prompt(self, problem):
+        return "P:"
+
+    def tokens(self, text):
+        import re
+        return [(i, m.start(), m.end()) for i, m in enumerate(re.finditer(r"\d|[^\d\s]+|\s+", text))]
+
+    def nll(self, prompt, ids):
+        t = self.text
+        return [9.0 if t[a:b] == "4" and t[a - 1:a] == "5" else 0.1 for _, a, b in self.tokens(t)]
+
+
+class CheckerTest(unittest.TestCase):
+    def test_flags_only_the_wrong_number(self):
+        from app import checker
+        text = "7 x 8 = 54, y 2,5 + 1 = 3,5 €"
+        r = checker.check(FakeScorer(text), {"answer": "A"}, text, threshold=5)
+        self.assertEqual([n["text"] for n in r["numbers"]], ["7", "8", "54", "2,5", "1", "3,5"])
+        self.assertEqual([n["text"] for n in r["numbers"] if n["flag"]], ["54"])
+
+    def test_off_without_config(self):
+        from app import checker
+        self.assertFalse(checker.Worker({}, None, None).enabled)
+        self.assertFalse(checker.Worker({"checker": {"kind": "none"}}, None, None).enabled)
+
+    def test_explain_a_wrong_answer_runs_in_background(self):
+        from app import checker
+        tmp = tempfile.TemporaryDirectory()
+        svc = make_service(tmp.name)
+        try:
+            done = threading.Event()
+            svc.checker = checker.Worker({"checker": {"kind": "llama", "threshold": 5}}, svc._explanation_job,
+                                         lambda *a: (svc._explanation_done(*a), done.set()))
+            svc.checker.scorer = FakeScorer("7 x 8 = 54")
+            s = svc.add_student({"name": "Eva", "start_level": 1})
+            a = svc.student_home(s["id"])["current"]
+            p1, p2, p3 = a["items"][:3]
+            right = {p["id"]: svc.problem(p["id"])["answer"] for p in (p1, p2)}
+            body = lambda pid: {"problem_id": pid, "text": "7 x 8 = 54"}
+            with self.assertRaises(ApiError):                     # not answered yet
+                svc.add_explanation(s["id"], a["id"], body(p1["id"]))
+            svc.check(s["id"], {"assignment_id": a["id"], "problem_id": p1["id"],
+                                "answer": "B" if right[p1["id"]] != "B" else "C"})
+            svc.check(s["id"], {"assignment_id": a["id"], "problem_id": p2["id"], "answer": right[p2["id"]]})
+            with self.assertRaises(ApiError):                     # right answers need no explanation
+                svc.add_explanation(s["id"], a["id"], body(p2["id"]))
+            r = svc.add_explanation(s["id"], a["id"], body(p1["id"]))   # mission still open: allowed
+            self.assertIn(r[p1["id"]]["status"], ("pending", "done"))
+            self.assertTrue(done.wait(5))
+            ex = svc.explanations(s["id"], a["id"])[p1["id"]]
+            self.assertEqual(ex["status"], "done")
+            self.assertEqual([n["text"] for n in ex["result"]["numbers"] if n["flag"]], ["54"])
+            self.assertEqual(svc.explanations("OTHER", a["id"]), {})   # other students can't read it
+        finally:
+            svc.db.close()
+            tmp.cleanup()
+
+
+class QwenEmbedderTest(unittest.TestCase):
+    """The "qwen" embedder: precomputed bank, live server for new texts, approximation without it."""
+    DIM = 16
+    TOPIC_AXIS = {"Algebra": 0, "Plane geometry": 1, "Arithmetic": 2}
+
+    def vec_for(self, text):
+        """Fake model: one axis per topic, picked from the wording (enough to tell topics apart)."""
+        v = [0.01] * self.DIM
+        t = text.lower()
+        v[0 if ("equation" in t or "unknown" in t) else 1 if ("area" in t or "perimeter" in t) else 2] = 1.0
+        n = sum(x * x for x in v) ** 0.5
+        return [x / n for x in v]
+
+    def setUp(self):
+        from array import array
+        self.tmp = tempfile.TemporaryDirectory()
+        seed = Path(self.tmp.name) / "seed"
+        seed.mkdir()
+        fake_seed(seed)
+        probs = [json.loads(line) for line in (seed / "problems.jsonl").read_text().splitlines()]
+        flat = array("f")
+        for p in probs:
+            flat.extend(self.vec_for(p["text"]))
+        (seed / "emb_test.f32").write_bytes(flat.tobytes())
+        (seed / "emb_test.json").write_text(json.dumps({"model": "qwen-test", "dim": self.DIM, "ids": [p["id"] for p in probs]}))
+        self.server = None
+        self.cfg = {"school_name": "T", "teacher": {"user": "p", "password": "p", "name": "P"}, "portal_ip": "192.168.4.1",
+                    "port": 0, "dev": True, "data_dir": str(Path(self.tmp.name) / "data"), "seed_dir": str(seed),
+                    "embedder": {"kind": "qwen", "model": "qwen-test", "dim": self.DIM, "bank": "emb_test",
+                                 "url": "http://127.0.0.1:9/v1/embeddings"},
+                    "classifier": "knn", "initial_problems": 6, "weekend_problems": 8,
+                    "max_prerequisites_per_mistake": 2, "levels": 8}
+
+    def tearDown(self):
+        if self.server:
+            self.server.shutdown()
+            self.server.server_close()
+        self.tmp.cleanup()
+
+    def start_fake_server(self):
+        from http.server import BaseHTTPRequestHandler
+        outer = self
+
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                data = json.dumps({"data": [{"embedding": outer.vec_for(body["input"])}]}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.cfg["embedder"]["url"] = f"http://127.0.0.1:{self.server.server_address[1]}/v1/embeddings"
+
+    def test_without_server_uses_bank_and_approximates_new_texts(self):
+        svc = Service(self.cfg)
+        self.assertFalse(svc.live)
+        self.assertEqual(len(svc.index), 72)                      # the whole bank came precomputed
+        r = svc.classify({"text": "Solve the equation: the unknown x plus 3 equals 10"})
+        self.assertEqual(r["topic"], "Algebra")
+        p = svc.add_problem({"text": "Find the unknown in this equation: 2x = 8", "answer": "B"})
+        self.assertEqual(p["topic"], "Algebra")
+        row = svc.db.execute("SELECT embedder FROM problems WHERE id=?", (p["id"],)).fetchone()
+        self.assertEqual(row[0], "qwen-test~approx")
+        svc.db.close()
+        # the model server comes back: the approximation is redone with the real model at the next start
+        self.start_fake_server()
+        svc2 = Service(self.cfg)
+        self.assertTrue(svc2.live)
+        row = svc2.db.execute("SELECT embedder FROM problems WHERE id=?", (p["id"],)).fetchone()
+        self.assertEqual(row[0], "qwen-test")
+        svc2.db.close()
+
+    def test_live_server_embeds_new_texts(self):
+        self.start_fake_server()
+        svc = Service(self.cfg)
+        self.assertTrue(svc.live)
+        vec, name = svc.embed_text("The area of a square is 36 cm2")
+        self.assertEqual(name, "qwen-test")
+        self.assertAlmostEqual(vec[1], max(vec))
+        svc.db.close()
 
 
 class HttpTest(unittest.TestCase):
@@ -248,6 +500,63 @@ class HttpTest(unittest.TestCase):
                 return r.status, json.loads(r.read())
         except urllib.error.HTTPError as e:
             return e.code, json.loads(e.read())
+
+    def test_parallel_requests_keep_the_session(self):
+        """Regression: after handing in, the result page asks for 3 things at once while the checker
+        saves in the background. The shared SQLite connection used to lose the session (401 -> logout)."""
+        tmp = tempfile.TemporaryDirectory()
+        svc = make_service(tmp.name)                      # its own server: doesn't touch the other tests' data
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(svc, str(ROOT / "www")))
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        self.addCleanup(tmp.cleanup)
+        self.addCleanup(svc.db.close)
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        old_base, self.base = self.base, base
+        self.addCleanup(setattr, self, "base", old_base)
+        s = self.client()
+        st = svc.add_student({"name": "Paralelo", "classroom": "4A", "start_level": 1})
+        self.assertEqual(self.call(s, "/api/login", {"role": "student", "code": st["id"]})[0], 200)
+        _, home = self.call(s, "/api/student/home")
+        a = home["current"]
+        for p in a["items"]:
+            self.call(s, "/api/student/check", {"assignment_id": a["id"], "problem_id": p["id"], "answer": "A"})
+        code, res = self.call(s, "/api/student/submit", {"assignment_id": a["id"], "answers": {}})
+        self.assertEqual(code, 200)
+        cookie = next(c for c in s.handlers if isinstance(c, urllib.request.HTTPCookieProcessor)).cookiejar
+        header = "; ".join(f"{c.name}={c.value}" for c in cookie)
+        stop, bad = threading.Event(), []
+
+        def writer():                                     # like the checker saving results meanwhile
+            while not stop.is_set():
+                with svc.lock, svc.db:
+                    svc.db.execute("UPDATE students SET xp=xp WHERE id=?", (st["id"],))
+
+        def reader(path):
+            for _ in range(15):
+                req = urllib.request.Request(self.base + path, headers={"Cookie": header})
+                try:
+                    with urllib.request.urlopen(req) as r:
+                        body = json.loads(r.read())
+                        if path == "/api/me" and body.get("role") != "student":
+                            bad.append((path, "role", body))
+                except urllib.error.HTTPError as e:
+                    bad.append((path, e.code))
+                except OSError as e:
+                    bad.append((path, repr(e)))
+        paths = [f"/api/student/results/{a['id']}", f"/api/student/assignments/{a['id']}/explanations",
+                 "/api/student/home", "/api/me"] * 2
+        w = threading.Thread(target=writer)
+        w.start()
+        threads = [threading.Thread(target=reader, args=(p,)) for p in paths]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        stop.set()
+        w.join()
+        self.assertEqual(bad, [])
 
     def test_roles_and_flow(self):
         t, s = self.client(), self.client()

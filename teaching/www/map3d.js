@@ -434,9 +434,11 @@ async function viewMap() {
       return `<button class="map-link" data-i="${j}"><span>${nodeLabel(data.nodes[j])} · ${esc(sub(data.subtopics[data.nodes[j][N_SUB]]))}</span><b>${st}</b><em>${Math.round(s * 100)}%</em></button>`; }).join("")}</div>` : "";
     side.innerHTML = `<div class="row"><button class="linkbtn small" id="back">← Todo el mapa</button></div>
       <div class="row" style="margin:6px 0 10px">${status}<span class="chip">${lvl(p.level)} · pregunta ${p.num ?? "?"}</span><span class="chip teal">${esc(sub(p.subtopic))}</span></div>
-      ${p.image ? `<a class="img-scroll" href="${p.image}" target="_blank" rel="noopener"><img class="problem-img" src="${p.image}" alt=""></a>` : ""}
-      ${p.text ? `<div class="problem-text small" style="margin-top:8px">${esc(p.text)}</div>` : ""}
-      ${!student ? `<div class="small" style="margin-top:8px">Respuesta <b>${p.answer}</b>${cs ? ` · ${cs.ok}/${cs.n} aciertos en clase` : ""}</div>` : ""}
+      <div class="map-problem">
+        ${statement(p)}
+        ${tiles(p, { small: true, result: !student ? { answer: p.answer, given: null } : null })}
+      </div>
+      ${!student && cs ? `<div class="small muted" style="margin-top:8px">${cs.ok}/${cs.n} aciertos en clase</div>` : ""}
       ${list(m.out[i], "Después: parecidos y un poco más difíciles")}${list(m.inn[i], "Antes: parecidos y un poco más fáciles")}`;
     $("#back").onclick = () => m.setFocus(null);
     $$(".map-link", side).forEach((b) => (b.onclick = () => m.select(Number(b.dataset.i))));

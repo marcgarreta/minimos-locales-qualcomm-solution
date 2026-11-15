@@ -1,0 +1,23 @@
+# Qwen3.5 0.8B on 127.0.0.1:8081 for the calculation check (app/checker.py).
+# Same flags as math-llm.service of the challenge repo, but as a container: it needs no sudo
+# and starts on boot like the portal. Uses the Python image the board already has (no internet).
+#
+# On the board (prebuilt llama.cpp for ARM64, no compiler needed):
+#   ~/llama.cpp/llama-b12383/   <- llama-b12383-bin-ubuntu-arm64.tar.gz from the llama.cpp releases
+#   ~/models/Qwen_Qwen3.5-0.8B-Q8_0.gguf   (sha256 7182e2362766bb95...)
+#   cp compose.yaml ~/llama.cpp/ && cd ~/llama.cpp && docker compose up -d
+services:
+  llm:
+    image: ghcr.io/arduino/app-bricks/python-apps-base:0.5.0
+    container_name: math-llm
+    user: "1000:1000"
+    entrypoint: ["/llama/llama-b12383/llama-server"]
+    command: ["-m", "/models/Qwen_Qwen3.5-0.8B-Q8_0.gguf", "--host", "127.0.0.1", "--port", "8081",
+              "--threads", "4", "--ctx-size", "4096", "--parallel", "1", "--cache-ram", "0",
+              "--ctx-checkpoints", "2", "--jinja", "--reasoning", "off", "--reasoning-budget", "0",
+              "--alias", "qwen3.5-0.8b"]
+    network_mode: host          # 127.0.0.1:8081 is the board's loopback: the portal reaches it
+    volumes:
+      - /home/arduino/llama.cpp:/llama:ro
+      - /home/arduino/models:/models:ro
+    restart: always

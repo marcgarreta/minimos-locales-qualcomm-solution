@@ -19,14 +19,14 @@ class NoClassifier:
 class KnnClassifier:
     name = "knn"
 
-    def __init__(self, embedder, index, meta, k=15):
-        self.embedder, self.index, self.meta, self.k = embedder, index, meta, k
+    def __init__(self, embed, index, meta, k=15):
+        self.embed, self.index, self.meta, self.k = embed, index, meta, k
 
     def classify(self, text, topic=None):
         """`topic` (optional) fixes the topic chosen by the teacher; then only the subtopic is voted."""
         if not text.strip() or not len(self.index):
             return NoClassifier().classify(text, topic)
-        q = self.embedder.embed(text)
+        q = self.embed(text)
         nb = self.index.search(q, k=self.k, topic=topic)
         nb = [(pid, max(s, 0.0) + 1e-6) for pid, s in nb]
         votes = {}
@@ -64,7 +64,7 @@ class KnnClassifier:
         }
 
 
-def make(cfg, embedder, index, meta):
+def make(cfg, embed, index, meta):
     if cfg.get("classifier") == "knn":
-        return KnnClassifier(embedder, index, meta)
+        return KnnClassifier(embed, index, meta)
     return NoClassifier()

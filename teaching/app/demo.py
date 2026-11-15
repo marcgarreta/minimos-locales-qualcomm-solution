@@ -17,6 +17,31 @@ STUDENTS = [
 ]
 CLASSROOM = "4º A"
 
+# A sixth student for the live demo of the calculation check: no history and always the same
+# mission, so the demo can be repeated after `python3 server.py --reset-demo` (see README, "Demo").
+# Problem 1 (lvl-0_2016_16): a 15 x 9 cm rectangle loses a 2 cm square at each corner; the
+# perimeter stays 2 x (15 + 9) = 48 cm. Answer B (40 cm) and explain
+# "Recortar las esquinas no cambia el perímetro. 15 + 9 = 20 y 2 x 20 = 40 cm." -> 20 is marked red.
+DEMO_STUDENT = ("DEM-123", "Elena Ruiz", 1)
+DEMO_MISSION = ["lvl-0_2016_16", "lvl-0_2015_10", "lvl-1_2024_2", "lvl-0_2019_15", "lvl-0_2015_1"]
+
+
+def create_demo_student(svc, mission=None):
+    """The demo student and her fixed mission; skipped if any problem is missing from the bank."""
+    ids = mission or DEMO_MISSION
+    if any(pid not in svc._meta for pid in ids):
+        return None
+    code, name, start = DEMO_STUDENT
+    svc.add_student({"name": name, "classroom": CLASSROOM, "start_level": start}, code=code)
+    a = svc.student_home(code)["current"]
+    with svc.lock, svc.db:
+        svc.db.execute("DELETE FROM assignment_items WHERE assignment_id=?", (a["id"],))
+        svc.db.executemany(
+            "INSERT INTO assignment_items (assignment_id, position, problem_id, role) VALUES (?,?,?,?)",
+            [(a["id"], i, pid, "practica") for i, pid in enumerate(ids)])
+        svc.db.execute("UPDATE assignments SET title=? WHERE id=?", ("Misión de demostración", a["id"]))
+    return code
+
 
 def _move_back(svc, aid, days):
     """Date a simulated mission in a past week, so "today" counters and streaks stay real."""
@@ -48,4 +73,7 @@ def create(svc, rounds=3, seed=7):
                 _move_back(svc, a["id"], days=7 * (rounds - k))
     finally:
         svc.rng = old_rng
-    print(f"created {len(STUDENTS)} example students: " + ", ".join(c for c, _, _ in STUDENTS), flush=True)
+    codes = [c for c, _, _ in STUDENTS]
+    if create_demo_student(svc):
+        codes.append(DEMO_STUDENT[0])
+    print(f"created {len(codes)} example students: " + ", ".join(codes), flush=True)

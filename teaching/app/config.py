@@ -4,6 +4,7 @@ EDU_PORT=8000 EDU_DEV=1 python server.py   -> serves on localhost, accepts any H
 """
 import json
 import os
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -15,12 +16,11 @@ def load(path=None):
     cfg["dev"] = os.environ.get("EDU_DEV") == "1"
     if os.environ.get("EDU_DATA_DIR"):
         cfg["data_dir"] = os.environ["EDU_DATA_DIR"]
-    for key in ("data_dir", "seed_dir", "answer_zone_path"):
+    cfg.setdefault("ocr_handoff_path", "ocr_handoff")     # the team's OCR pipeline (app/figures.py)
+    cfg.setdefault("vendor_path", "vendor")               # extra wheels installed offline (onnxruntime)
+    for key in ("data_dir", "seed_dir", "ocr_handoff_path", "vendor_path"):
         p = Path(cfg[key])
         cfg[key] = str(p if p.is_absolute() else ROOT / p)
-    # answer_zone lives in the repo root (arduino/..) or, outside the repo, in a sibling clone
-    for cand in (cfg["answer_zone_path"], ROOT.parent, ROOT.parent / "minimos-locales-qualcomm"):
-        if (Path(cand) / "answer_zone").is_dir():
-            cfg["answer_zone_path"] = str(cand)
-            break
+    if Path(cfg["vendor_path"]).is_dir() and cfg["vendor_path"] not in sys.path:
+        sys.path.append(cfg["vendor_path"])
     return cfg

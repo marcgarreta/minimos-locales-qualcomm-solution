@@ -41,7 +41,7 @@ def _map(s, who, m, q, b):
     return s.map_data(q.get("topic", ""), who[0], who[1])
 
 
-@route("GET", "/api/student/problem/([\w.-]+)", "student")
+@route("GET", "/api/student/problem/([\\w.-]+)", "student")
 def _student_problem(s, who, m, q, b):
     return s.problem_for_student(who[1], m.group(1))
 
@@ -112,6 +112,11 @@ def _home(s, who, m, q, b):
     return s.student_home(who[1])
 
 
+@route("POST", "/api/student/check", "student")
+def _check(s, who, m, q, b):
+    return s.check(who[1], b)
+
+
 @route("POST", "/api/student/submit", "student")
 def _submit(s, who, m, q, b):
     return s.submit(who[1], b)
@@ -120,6 +125,16 @@ def _submit(s, who, m, q, b):
 @route("GET", "/api/student/results/(\\d+)", "student")
 def _result(s, who, m, q, b):
     return s.result(who[1], int(m.group(1)))
+
+
+@route("GET", "/api/student/assignments/(\\d+)/explanations", "student")
+def _explanations(s, who, m, q, b):
+    return s.explanations(who[1], int(m.group(1)))
+
+
+@route("POST", "/api/student/assignments/(\\d+)/explanations", "student")
+def _add_explanation(s, who, m, q, b):
+    return s.add_explanation(who[1], int(m.group(1)), b)
 
 
 def make_handler(svc, www):

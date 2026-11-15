@@ -7,9 +7,14 @@
   "data_dir": "data",
   "seed_dir": "seed",
 
-  "embedder": { "kind": "hash", "dim": 384, "url": "http://127.0.0.1:8082/embedding" },
+  "embedder": {
+    "kind": "qwen", "model": "qwen3-embedding-0.6b", "dim": 1024,
+    "url": "http://127.0.0.1:8082/v1/embeddings", "bank": "emb_qwen3"
+  },
   "classifier": "knn",
-  "answer_zone_path": "..",
+  "checker": { "kind": "llama", "url": "http://127.0.0.1:8081", "threshold": 5.0 },
+  "ocr_handoff_path": "ocr_handoff",
+  "vendor_path": "vendor",
 
   "demo_students": true,
   "initial_problems": 8,

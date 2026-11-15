@@ -10,7 +10,7 @@ few places up the ladder, which is the same level except for its last questions:
 of the "tree".
 
 Inputs:  seed/problems.jsonl (ids, topic, level), data/texts.parquet (row order of the
-         embeddings), results/emb/bge-small-q8.npy (bge-small-en-v1.5 Q8_0, the model on the board).
+         embeddings), results/emb/qwen3doc-0.6b-q8.npy (Qwen3-Embedding-0.6B Q8_0, no prompt: the app's model).
 Output:  seed/layout.json  {"model", "topics": {topic: {"pos": {id: [x, y]}, "edges": [[a, b, cos]]}}}
 Positions are centred and scaled to about [-1, 1].
 """
@@ -38,7 +38,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--problems", default=str(HERE / "problems.jsonl"))
     ap.add_argument("--texts", default=str(find("data/texts.parquet")))
-    ap.add_argument("--emb", default=str(find("results/emb/bge-small-q8.npy")))
+    ap.add_argument("--emb", default=str(find("results/emb/qwen3doc-0.6b-q8.npy")))
     ap.add_argument("--k", type=int, default=2, help="arrows from each problem to harder similar ones")
     ap.add_argument("--step", type=int, default=4, help="how many places up the difficulty ladder to look first")
     ap.add_argument("--neighbors", type=int, default=15)

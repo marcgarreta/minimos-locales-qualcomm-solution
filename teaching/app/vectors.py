@@ -20,7 +20,11 @@ def to_blob(vec):
 def from_blob(blob):
     a = array("f")
     a.frombytes(blob)
-    return list(a)
+    return a
+
+
+def _row(vec):
+    return vec if isinstance(vec, array) and vec.typecode == "f" else array("f", vec)
 
 
 class VectorIndex:
@@ -37,13 +41,13 @@ class VectorIndex:
     def add(self, pid, vec, level, topic):
         if pid in self._pos:
             i = self._pos[pid]
-            self._rows[i], self.levels[i], self.topics[i] = list(vec), level, topic
+            self._rows[i], self.levels[i], self.topics[i] = _row(vec), level, topic
         else:
             self._pos[pid] = len(self.ids)
             self.ids.append(pid)
             self.levels.append(level)
             self.topics.append(topic)
-            self._rows.append(list(vec))
+            self._rows.append(_row(vec))
         self._mat = None
 
     def vector(self, pid):
@@ -63,7 +67,7 @@ class VectorIndex:
     def _scores(self, q):
         if np is not None:
             if self._mat is None:
-                self._mat = np.asarray(self._rows, dtype=np.float32).reshape(-1, self.dim)
+                self._mat = np.frombuffer(b"".join(r.tobytes() for r in self._rows), dtype=np.float32).reshape(-1, self.dim)
                 self._lv = np.asarray(self.levels)
                 self._tp = np.asarray(self.topics, dtype=object)
             return self._mat @ np.asarray(q, dtype=np.float32)
