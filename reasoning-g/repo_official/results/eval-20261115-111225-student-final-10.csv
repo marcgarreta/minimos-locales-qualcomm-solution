@@ -1,0 +1,11 @@
+id,language,level,has_options,label,answer,correct,seconds,status,prompt_tokens,retrieved,requires_vision,images_sent,image_mode
+lvl-3_2026_1,cat,3,True,A,A,1,2.17,figure_no_vision_ok,88,,False,0,separate
+lvl-1_2026_15,cat,1,True,E,A,0,1.44,ok,120,,False,0,separate
+lvl-1_2026_15,eng,1,True,E,A,0,1.14,ok,104,,False,0,separate
+lvl-3_2026_11,eng,3,True,D,E,0,1.02,ok,79,,False,0,separate
+lvl-2_2026_2,cat,2,True,D,A,0,1.29,figure_no_vision_ok,99,,False,0,separate
+lvl-3_2026_1,eng,3,True,A,A,1,1.89,figure_no_vision_ok,77,,False,0,separate
+lvl-3_2026_11,cat,3,True,D,E,0,2.0,ok,89,,False,0,separate
+lvl-2_2026_2,eng,2,True,D,A,0,1.37,figure_no_vision_ok,86,,False,0,separate
+lvl-0_2026_3,eng,0,True,E,E,1,0.74,figure_no_vision_ok,66,,False,0,separate
+lvl-0_2026_3,cat,0,True,E,A,0,1.28,figure_no_vision_ok,67,,False,0,separate

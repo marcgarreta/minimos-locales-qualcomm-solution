@@ -1,0 +1,2 @@
+time,name,commit,input,languages,n,rag_k,accuracy,mean_s,worst_s,over_limit
+20261115-111225,student-final-10,4360339,../data/practice/records10.jsonl,all,10,0,30.0,1.4,2.2,0
