@@ -17,8 +17,20 @@ Los dos scripts usan `adb` (USB) por defecto, o SSH si defines `BOARD=arduino@<i
 BOARD=arduino@192.168.1.50 ./upload_teaching.sh       # SSH
 ```
 
-Copia `teaching/` a `/home/arduino/edu-portal` (la ruta que espera `teaching/install.sh`) y ejecuta
-`install.sh` en la placa. Detalles, usuarios de prueba y cómo probarla en el portátil: `teaching/README.md`.
+Qué hace, en este orden:
+
+1. Hace backup de la instalación anterior (`~/edu-portal.bak-<fecha>`). Nunca toca `data/` (base de datos y fotos de los alumnos).
+2. Copia el código de `teaching/` a `/home/arduino/edu-portal`, la ruta que espera `install.sh`.
+3. Copia el banco de problemas desde `SEED_ASSETS` (por defecto `../minimos-locales-qualcomm/arduino/seed`):
+   `problems.jsonl`, `emb_qwen3.*`, `figures.json`, `images/`.
+   - Viene de M3Kang, que es solo para investigación: **no se sube ni a GitHub ni a Hugging Face**.
+   - Se construye en el portátil con `teaching/seed/build_seed.py`, `build_embeddings.py` y `build_figures.py`.
+4. Baja onnxruntime 1.32.0 para la placa (aarch64, Python 3.13) a `vendor/`.
+5. Baja de Hugging Face, si falta, el modelo 0.8B del corrector y comprueba su SHA-256.
+6. Para el contenedor `edu-portal` y ejecuta `install.sh`.
+
+**Probado en la placa:** instalación OK y el portal responde HTTP 200. Usuarios de prueba y cómo probarla en el
+portátil: `teaching/README.md`.
 
 ## 2. Prediction (el test del jurado)
 
