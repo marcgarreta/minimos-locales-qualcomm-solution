@@ -17,3 +17,6 @@ __pycache__/
 
 # M3Kang subsets (research-only)
 reasoning-g/data/val40.jsonl
+
+# built by upload_teaching.sh
+.build/
