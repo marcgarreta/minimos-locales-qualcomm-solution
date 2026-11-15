@@ -1,0 +1,16 @@
+# Portal cautivo de la Wi-Fi "Edu-Wifi" del Arduino UNO Q + app Kangaroo Path.
+# Usa la imagen Python que ya trae la placa (no necesita internet ni build).
+services:
+  portal:
+    image: ghcr.io/arduino/app-bricks/python-apps-base:0.5.0
+    container_name: edu-portal
+    user: root
+    entrypoint: ["/bin/bash", "/portal/start.sh"]
+    network_mode: host          # necesita ver wlan0 para DHCP/DNS (y llega a llama.cpp en 127.0.0.1:8082)
+    cap_add: [NET_ADMIN, NET_RAW]
+    environment:
+      LD_LIBRARY_PATH: /portal/hostlib
+    volumes:
+      - ./:/portal:ro           # codigo, www/ y seed/: edita y recarga
+      - ./data:/portal/data     # base de datos SQLite y fotos subidas (escribible)
+    restart: always             # arranca solo al encender la placa

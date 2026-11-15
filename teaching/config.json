@@ -1,0 +1,19 @@
+{
+  "school_name": "Kangaroo Path",
+  "teacher": { "user": "profe", "password": "canguro", "name": "Profesor/a" },
+
+  "portal_ip": "192.168.4.1",
+  "port": 80,
+  "data_dir": "data",
+  "seed_dir": "seed",
+
+  "embedder": { "kind": "hash", "dim": 384, "url": "http://127.0.0.1:8082/embedding" },
+  "classifier": "knn",
+  "answer_zone_path": "..",
+
+  "demo_students": true,
+  "initial_problems": 8,
+  "weekend_problems": 8,
+  "max_prerequisites_per_mistake": 2,
+  "levels": 8
+}
